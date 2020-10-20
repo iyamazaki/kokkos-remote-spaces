@@ -51,16 +51,17 @@
 typedef Kokkos::Experimental::DefaultRemoteMemorySpace RemoteMemSpace_t;
 typedef Kokkos::View<double **, RemoteMemSpace_t> RemoteView_t;
 
+// MPI version (just a copy of above with different way of accessing x)
 template <class YType, class AType, class XType>
-void spmv(YType y, AType A, XType x) {
+void spmv_local(YType y, AType A, XType x) {
 
-#ifdef KOKKOS_ENABLE_CUDA
+  #ifdef KOKKOS_ENABLE_CUDA
   int rows_per_team = 16;
   int team_size = 16;
-#else
+  #else
   int rows_per_team = 512;
   int team_size = 1;
-#endif
+  #endif
 
   int vector_length = 8;
 
@@ -91,16 +92,14 @@ void spmv(YType y, AType A, XType x) {
                     int64_t idx = A.col_idx(i + row_start);
                     int64_t pid = idx / MASK;
                     int64_t offset = idx % MASK;
-//printf( " (row=%d, col=%d): %e * %e (pid=%d, offset=%d)\n",row,idx,A.values(i + row_start), x(pid, offset),pid,offset );
-                    sum += A.values(i + row_start) * x(pid, offset);
+                    //printf( " (row=%d, col=%d): %e * %e (pid=%d, offset=%d, MASK=%d)\n",(int)row,(int)idx,A.values(i + row_start), x(pid), (int)pid, (int)offset, (int)MASK );
+                    sum += A.values(i + row_start) * x(offset);
                   },
                   y_row);
-//printf( " -> y(%d) = %e\n\n",row,y_row );
+                  //printf( " -> y(%d) = %e\n\n",row,y_row );
               y(row) = y_row;
             });
       });
-
-  RemoteMemSpace_t().fence();
 }
 
 template <class YType, class XType> double dot(YType y, XType x) {
@@ -132,9 +131,11 @@ template <class VType> void print_vector(int label, VType v) {
   std::cout << "\n\nPRINT DONE " << v.label() << std::endl << std::endl;
 }
 
-template <class VType, class AType, class PType>
-int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
-             double tolerance) {
+template <class VType, class AType>
+int cg_solve(VType x, AType A, VType b,
+             //VType Ar,  PType Ar_global,
+             VType Ar, VType Ar_global,
+             int max_iter, double tolerance) {
   int myproc = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &myproc);
   int num_iters = 0;
@@ -161,13 +162,12 @@ int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
   VType Ap("Ap", x.extent(0));
 
   // extra vectors needed for pipeline
-  VType Ar(Ar_global.data(), x.extent(0)); // Globally accessible data
   VType AAp("AAp", x.extent(0));
   VType AAr("AAr", x.extent(0));
 
   // r = b - A*x
-  axpby(Ar, zero, x, one, x);   // Ar = x
-  spmv(AAr, A, Ar_global);      // AAr = A*Ar
+  axpby(Ar, zero, x, one, x);     // Ar = x
+  spmv_local(AAr, A, Ar_global);  // AAr = A*Ar
   axpby(r, one, b, -one, AAr);  // r = b-AAr
 
   //printf("Init: x, Ax, b, r\n" );
@@ -188,7 +188,7 @@ int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
 
   // Ar = A*r 
   axpby(Ar, one, r, zero, r);      // Ar = r
-  spmv(AAr, A, Ar_global);         // AAr = A*Ar
+  spmv_local(AAr, A, Ar_global);   // AAr = A*Ar
   axpby(Ar, one, AAr, zero, AAr);  // Ar = AAr
 
   for (int64_t k = 1; k <= max_iter && normr > tolerance; ++k) {
@@ -201,8 +201,8 @@ int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
     MPI_Allreduce(MPI_IN_PLACE, &rAr, 1, MPI_DOUBLE, MPI_SUM,
                   MPI_COMM_WORLD);
 
-    // t = A*w (t is AAR)
-    spmv(AAr, A, Ar_global);
+    // AAr = A*Ar
+    spmv_local(AAr, A, Ar_global);
 
     // synch dots
     // ...
@@ -282,38 +282,61 @@ int main(int argc, char *argv[]) {
     int N = argc > 1 ? atoi(argv[1]) : 100;
     int max_iter = argc > 2 ? atoi(argv[2]) : 200;
     double tolerance = argc > 3 ? atoi(argv[3]) : 1e-7;
-    CrsMatrix<Kokkos::HostSpace> h_A = Impl::generate_miniFE_matrix(N);
-    Kokkos::View<double *, Kokkos::HostSpace> h_b =
-        Impl::generate_miniFE_vector(N);
 
+    using default_execution_space = Kokkos::DefaultExecutionSpace;
+    using default_memory_space = typename default_execution_space::memory_space;
+    std::cout << std::endl;
+    std::cout << "Default execution space: " << default_execution_space::name () << std::endl;
+    std::cout << "Default memory space   : " << default_memory_space::name () << std::endl;
+    std::cout << std::endl;
+
+    // generate matrix on host
+    CrsMatrix<Kokkos::HostSpace> h_A = Impl::generate_miniFE_matrix(N);
+    // copy the matrix to device
     Kokkos::View<int64_t *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
     Kokkos::View<int64_t *> col_idx("col_idx", h_A.col_idx.extent(0));
-    Kokkos::View<double *> values("values", h_A.values.extent(0));
+    Kokkos::View<double  *>  values("values",  h_A.values.extent(0));
     CrsMatrix<Kokkos::DefaultExecutionSpace::memory_space> A(
         row_ptr, col_idx, values, h_A.num_cols());
-    Kokkos::View<double *> b("b", h_b.extent(0));
-
-    Kokkos::deep_copy(b, h_b);
     Kokkos::deep_copy(A.row_ptr, h_A.row_ptr);
     Kokkos::deep_copy(A.col_idx, h_A.col_idx);
-    Kokkos::deep_copy(A.values, h_A.values);
+    Kokkos::deep_copy(A.values,  h_A.values);
 
-    // Remote View
-    RemoteView_t p = Kokkos::Experimental::allocate_symmetric_remote_view<RemoteView_t>(
-        "MyView", numRanks, (h_b.extent(0) + numRanks - 1) / numRanks);
+    // generate rhs
+    Kokkos::View<double *, Kokkos::HostSpace> h_b =
+        Impl::generate_miniFE_vector(N);
+    // copy rhs too device
+    Kokkos::View<double *> b("b", h_b.extent(0));
+    Kokkos::deep_copy(b, h_b);
 
-    int64_t start_row = myRank * p.extent(1);
-    int64_t end_row = (myRank + 1) * p.extent(1);
-    if (end_row > h_b.extent(0))
-      end_row = h_b.extent(0);
+/*Kokkos::fence();
+printf( " A = [\n" );
+for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
+  for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) printf( "%d %d %.16e %d\n",i,h_A.col_idx(k), h_A.values(k), k );
+}
+printf("];\n");*/
+
+    // global
+    int n = h_b.extent(0);
+    int nlocal = (h_b.extent(0) + numRanks - 1) / numRanks;
+    int64_t start_row = myRank * nlocal;
+    int64_t end_row = (myRank + 1) * nlocal;
+    if (end_row > n)
+      end_row = n;
 
     // CG
     Kokkos::pair<int64_t, int64_t> bounds(start_row, end_row);
     Kokkos::View<double *> b_sub = Kokkos::subview(b, bounds);
     Kokkos::View<double *> x_sub("x", b_sub.extent(0));
 
+    // input vector for SpMV
+    Kokkos::View<double *> p("p", n); // global
+    Kokkos::View<double *> p_sub = Kokkos::subview(p, bounds); // local
+
     Kokkos::Timer timer;
-    int num_iters = cg_solve(x_sub, A, b_sub, p, max_iter, tolerance);
+    int num_iters = cg_solve(x_sub, A, b_sub,
+                             p_sub, p,
+                             max_iter, tolerance);
     double time = timer.seconds();
 
     {
@@ -322,7 +345,7 @@ int main(int argc, char *argv[]) {
       Kokkos::View<double *> r("Y", x_sub.extent(0));
       Kokkos::View<double *> q(p.data(), x_sub.extent(0));
       axpby(q, one, x_sub, zero, x_sub);
-      spmv(r, A, p);
+      spmv_local(r, A, p);
       axpby(r, -one, r, one, b_sub);
       //for (int i = 0; i < r.extent(0); i++) printf( "%d %e %e %e\n",i,b_sub(i),x_sub(i),r(i));
 
@@ -367,8 +390,8 @@ int main(int argc, char *argv[]) {
 
     if (myRank == 0) {
       printf(
-        " N = %i, num_iters = %i, total_flops = %.2e, time = %.2lf, GFlops = %.2lf, GBs = %.2lf\n", 
-        N, num_iters, total_flops, time, GFlops, GBs
+        " N = %i, n = %i, num_iters = %i, total_flops = %.2e, time = %.2lf, GFlops = %.2lf, GBs = %.2lf\n\n", 
+        N, n, num_iters, total_flops, time, GFlops, GBs
       );
     }
   }
