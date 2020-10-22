@@ -48,6 +48,7 @@
 #include <mpi.h>
 
 #define CGSOLVE_TIMER
+#define CGSOLVE_GPU_AWARE_MPI
 
 // -------------------------------------------------------------
 // SpMV
@@ -69,6 +70,8 @@ struct cgsolve_spmv
   A(A_)
   {}
 
+  // -------------------------------------------------------------
+  // setup P2P
   void setup() {
     MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
     MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
@@ -76,8 +79,6 @@ struct cgsolve_spmv
     // global/local dimension
     nlocal = (n + numRanks - 1) / numRanks;
 
-    // TODO: need to know if GPU-aware, and integer_view_t should be on device/host
-    // TODO: if GPU-aware, do setup on mirror view and deep-copy at the end?
     // ----------------------------------------------------------
     // find which elements to receive from which process
     host_integer_view_t num_recvs("num_recvs", numRanks);
@@ -180,19 +181,18 @@ struct cgsolve_spmv
     requests = (MPI_Request*)malloc(num_neighbors * sizeof(MPI_Request));
   }
 
+  // -------------------------------------------------------------
+  // P2P by MPI
   void exchange(XType x) {
-    // TODO: need to know if GPU-aware
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     Kokkos::Timer timer;
     #endif
 
-    // pack
-    int num_sends = ngb_sends.extent(0);
-    auto host_sends = Kokkos::create_mirror_view(buf_sends);
-    #if 1
-    #ifdef CGSOLVE_TIMER
+    // pack on device
+    #if defined(CGSOLVE_TIMER)
     timer.reset();
     #endif
+    int num_sends = ngb_sends.extent(0);
     Kokkos::parallel_for(team_policy_type(num_sends, Kokkos::AUTO),
       KOKKOS_LAMBDA(const member_type & team) {
         int q = team.league_rank();
@@ -205,47 +205,44 @@ struct cgsolve_spmv
           });
       });
     Kokkos::fence();
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_comm_pack = timer.seconds();
     #endif
 
-    #ifdef CGSOLVE_TIMER
+    // copy to host
+    #if defined(CGSOLVE_TIMER)
     timer.reset();
     #endif
+    #if !defined(CGSOLVE_GPU_AWARE_MPI)
+    auto host_sends = Kokkos::create_mirror_view(buf_sends);
     Kokkos::deep_copy(host_sends, buf_sends);
-    #ifdef CGSOLVE_TIMER
+    #endif
+    #if defined(CGSOLVE_TIMER)
     time_comm_copy = timer.seconds();
     #endif
-    #else
-    timer.reset();
-    auto host_x = Kokkos::create_mirror_view(x);
-    Kokkos::deep_copy(host_x, x);
-    time_comm_copy = timer.seconds();
 
-    for (int q=0; q<num_sends; q++) {
-      int p = ngb_sends(q);
-      int start = ptr_sends(q);
-      int count = ptr_sends(q+1)-start;
-      for (int k=start; k<start+count; k++) {
-        host_sends(k) = host_x(idx_sends(k));
-      }
-    }
-    #endif
-
-    // send
-    #ifdef CGSOLVE_TIMER
+    // P2P with MPI
+    #if defined(CGSOLVE_TIMER)
     timer.reset();
     #endif
+    // send on host
     for (int q=0; q<num_sends; q++) {
       int p = host_ngb_sends(q);
       int start = host_ptr_sends(q);
       int count = host_ptr_sends(q+1)-start;
       //printf( " %d: MPI_Isend(count = %d, p = %d)\n",myRank,count,p );
+      #if !defined(CGSOLVE_GPU_AWARE_MPI)
       MPI_Isend(&(host_sends(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests[q]);
+      #else
+      double *buffer = buf_sends.data();
+      MPI_Isend(&buffer[start], count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests[q]);
+      #endif
     }
 
-    // recv
+    // recv on host
+    #if !defined(CGSOLVE_GPU_AWARE_MPI)
     auto host_recvs = Kokkos::create_mirror_view(buf_recvs);
+    #endif
     for (int q=0; q<ngb_recvs.extent(0); q++) {
       int p = host_ngb_recvs(q);
       int start = host_ptr_recvs(q);
@@ -253,24 +250,31 @@ struct cgsolve_spmv
 
       MPI_Status stat;
       //printf( " %d: MPI_Irecv(count = %d, p = %d)\n",myRank,count,p );
+      #if !defined(CGSOLVE_GPU_AWARE_MPI)
       MPI_Recv(&(host_recvs(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &stat);
+      #else
+      double *buffer = buf_recvs.data();
+      MPI_Recv(&buffer[start], count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &stat);
+      #endif
     }
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_comm_mpi = timer.seconds();
     #endif
 
-    // unpack
-    int num_recvs = ngb_recvs.extent(0);
-    #if 1
-    #ifdef CGSOLVE_TIMER
+    // copy to device
+    #if defined(CGSOLVE_TIMER)
     timer.reset();
     #endif
+    #if !defined(CGSOLVE_GPU_AWARE_MPI)
     Kokkos::deep_copy(buf_recvs, host_recvs);
-    #ifdef CGSOLVE_TIMER
+    #endif
+    #if defined(CGSOLVE_TIMER)
     time_comm_copy += timer.seconds();
     #endif
 
-    #ifdef CGSOLVE_TIMER
+    // unpack on device
+    int num_recvs = ngb_recvs.extent(0);
+    #if defined(CGSOLVE_TIMER)
     timer.reset();
     #endif
     Kokkos::parallel_for(team_policy_type(num_recvs, Kokkos::AUTO),
@@ -285,33 +289,22 @@ struct cgsolve_spmv
           });
       });
     Kokkos::fence();
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_comm_unpack = timer.seconds();
-    #endif
-    #else
-    for (int q=0; q<num_recvs; q++) {
-      int p = ngb_recvs(q);
-      int start = ptr_recvs(q);
-      int count = ptr_recvs(q+1)-start;
-      for (int k=start; k<start+count; k++) {
-        host_x(idx_recvs(k)) = host_recvs(k);
-      }
-    }
-    timer.reset();
-    Kokkos::deep_copy(x, host_x);
-    time_comm_copy += timer.seconds();
     #endif
 
     // wait for send
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     timer.reset();
     #endif
     MPI_Waitall(num_sends, requests, MPI_STATUSES_IGNORE);
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_comm_mpi += timer.seconds();
     #endif
   }
 
+  // -------------------------------------------------------------
+  // local SpMV
   void local_apply(YType y, XType x) {
     #ifdef KOKKOS_ENABLE_CUDA
     int rows_per_team = 16;
@@ -363,22 +356,24 @@ struct cgsolve_spmv
       });
   }
 
+  // -------------------------------------------------------------
+  // apply (exchange + local SpMV)
   void apply(YType y, XType x) {
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     Kokkos::Timer timer;
     #endif
 
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     timer.reset();
     #endif
     this->exchange(x);
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_comm = timer.seconds();
 
     timer.reset();
     #endif
     this->local_apply(y, x);
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_spmv = timer.seconds();
     #endif
   }
@@ -422,6 +417,7 @@ private:
 // -------------------------------------------------------------
 // dot
 template <class YType, class XType> double dot(YType y, XType x) {
+  // TODO: keep result on device?
   double result = 0.0;
   Kokkos::parallel_reduce(
       "DOT", y.extent(0),
@@ -455,7 +451,7 @@ int cg_solve(VType x, OP op, VType b,
   const double one = 1.0;
   const double zero = 0.0;
 
-  #ifdef CGSOLVE_TIMER
+  #if defined(CGSOLVE_TIMER)
   Kokkos::Timer timer_spmv;
   Kokkos::Timer timer_idot;
   double time_spmv = 0.0;
@@ -494,11 +490,11 @@ int cg_solve(VType x, OP op, VType b,
 
   // r = b - A*x
   axpby(Ar, zero, x, one, x);   // Ar = x
-  #ifdef CGSOLVE_TIMER
+  #if defined(CGSOLVE_TIMER)
   timer_spmv.reset();
   #endif
   op.apply(AAr, Ar_global);     // AAr = A*Ar
-  #ifdef CGSOLVE_TIMER
+  #if defined(CGSOLVE_TIMER)
   time_spmv += timer_spmv.seconds();
   time_spmv_comm   += op.time_comm;
   time_spmv_copy   += op.time_comm_copy;
@@ -526,11 +522,11 @@ int cg_solve(VType x, OP op, VType b,
 
   // Ar = A*r 
   axpby(Ar, one, r, zero, r);      // Ar = r
-  #ifdef CGSOLVE_TIMER
+  #if defined(CGSOLVE_TIMER)
   timer_spmv.reset();
   #endif
   op.apply(AAr, Ar_global);        // AAr = A*Ar
-  #ifdef CGSOLVE_TIMER
+  #if defined(CGSOLVE_TIMER)
   time_spmv += timer_spmv.seconds();
   time_spmv_comm   += op.time_comm;
   time_spmv_copy   += op.time_comm_copy;
@@ -544,25 +540,25 @@ int cg_solve(VType x, OP op, VType b,
   int num_iters = 0;
   for (int64_t k = 1; k <= max_iter && normr > tolerance; ++k) {
     // beta = r'*r
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     timer_idot.reset();
     #endif
     new_rr = dot(r, r);
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_idot += timer_idot.seconds();
     #endif
 
 
     // rAr = r'*Ar
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     timer_idot.reset();
     #endif
     rAr = dot(r, Ar);
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_idot += timer_idot.seconds();
     #endif
 
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     timer_idot.reset();
     #endif
     dots_out[0] = new_rr;
@@ -571,16 +567,16 @@ int cg_solve(VType x, OP op, VType b,
                   MPI_COMM_WORLD);
     new_rr = dots_out[0];
     rAr = dots_out[1];
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_idot_comm += timer_idot.seconds();
     #endif
 
     // AAr = A*Ar
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     timer_spmv.reset();
     #endif
     op.apply(AAr, Ar_global);
-    #ifdef CGSOLVE_TIMER
+    #if defined(CGSOLVE_TIMER)
     time_spmv += timer_spmv.seconds();
     time_spmv_comm   += op.time_comm;
     time_spmv_copy   += op.time_comm_copy;
@@ -642,20 +638,40 @@ int cg_solve(VType x, OP op, VType b,
 
     num_iters = k;
   }
-  #ifdef CGSOLVE_TIMER
+  #if defined(CGSOLVE_TIMER)
   double min_spmv = 0.0, max_spmv = 0.0;
   MPI_Allreduce(&time_spmv, &min_spmv, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
   MPI_Allreduce(&time_spmv, &max_spmv, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+  double min_copy = 0.0, max_copy = 0.0;
+  MPI_Allreduce(&time_spmv_copy, &min_copy, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(&time_spmv_copy, &max_copy, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+  double min_pack = 0.0, max_pack = 0.0;
+  MPI_Allreduce(&time_spmv_pack, &min_pack, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(&time_spmv_pack, &max_pack, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+  double min_unpack = 0.0, max_unpack = 0.0;
+  MPI_Allreduce(&time_spmv_unpack, &min_unpack, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(&time_spmv_unpack, &max_unpack, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+  double min_mpi = 0.0, max_mpi = 0.0;
+  MPI_Allreduce(&time_spmv_mpi, &min_mpi, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(&time_spmv_mpi, &max_mpi, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+  double min_comp = 0.0, max_comp = 0.0;
+  MPI_Allreduce(&time_spmv_spmv, &min_comp, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(&time_spmv_spmv, &max_comp, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
   if (myRank == 0) {
     printf( "\n  -------------------------------------------\n" );
-    printf( "   time(SpMV)             = %.2e -- %.2e seconds\n", min_spmv,max_spmv );
-    printf( "    + time(SpMV)::comm    =  %.2e seconds\n",time_spmv_comm );
-    printf( "     > time(SpMV)::copy   =  %.2e seconds\n",time_spmv_copy );
-    printf( "     > time(SpMV)::pack   =  %.2e seconds\n",time_spmv_pack );
-    printf( "     > time(SpMV)::unpack =  %.2e seconds\n",time_spmv_unpack );
-    printf( "     > time(SpMV)::mpi    =  %.2e seconds\n",time_spmv_mpi  );
-    printf( "    + time(SpMV)::spmv    =  %.2e seconds\n",time_spmv_spmv );
-    printf( "   time(iDot)           = %.2e seconds\n", time_idot+time_idot_comm );
+    printf( "   time(SpMV)            = %.2e ~ %.2e seconds\n", min_spmv,  max_spmv );
+    printf( "    + time(SpMV)::comm    =  %.2e ~ %.2e seconds\n",min_mpi,   max_mpi );
+    printf( "     > time(SpMV)::copy    =  %.2e ~ %.2e seconds\n",min_copy,  max_copy );
+    printf( "     > time(SpMV)::pack    =  %.2e ~ %.2e seconds\n",min_pack,  max_pack );
+    printf( "     > time(SpMV)::unpack  =  %.2e ~ %.2e seconds\n",min_unpack,max_unpack );
+    printf( "     > time(SpMV)::mpi     =  %.2e ~ %.2e seconds\n",min_mpi,   max_mpi  );
+    printf( "    + time(SpMV)::spmv    =  %.2e ~ %.2e seconds\n",min_comp,  max_comp );
+    printf( "   time(iDot)          = %.2e seconds\n", time_idot+time_idot_comm );
     printf( "    + time(iDot)::comm  =  %.2e seconds\n",time_idot_comm );
     printf( "  -------------------------------------------\n" );
   }
@@ -771,7 +787,7 @@ int main(int argc, char *argv[]) {
 
     // call CG
     if (myRank == 0) {
-      std::cout << " calling cg_solve ( N = " << N << ")" << std::endl;
+      std::cout << " calling cg_solve ( N = " << N << " )" << std::endl;
     }
     Kokkos::fence();
     Kokkos::Timer timer;
@@ -795,7 +811,7 @@ int main(int argc, char *argv[]) {
       rnorm = std::sqrt(rnorm);
       if (myRank == 0) {
         printf( "\n ====================================" );
-        printf( "\n rnorm=%e\n",rnorm );
+        printf( "\n rnorm = %e\n",rnorm );
       }
     }
 
