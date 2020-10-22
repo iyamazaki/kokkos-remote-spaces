@@ -217,7 +217,7 @@ int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
     // compute beta and alpha
     if (k == 1) {
       alpha = new_rr / rAr;
-      printf( " > alpha = %e / %e = %e\n",new_rr,rAr,alpha );
+      //printf( " > alpha = %e / %e = %e\n",new_rr,rAr,alpha );
       beta = zero;
     } else {
       #if 0
@@ -227,11 +227,11 @@ int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
       #else
       beta = new_rr / old_rr;
       pAp = rAr - new_rr * (beta / alpha);
-      printf( " > pap = %e - %e * (%e / %e) = %e\n",rAr,new_rr,beta,alpha, rAr - new_rr * (beta / alpha) );
+      //printf( " > pap = %e - %e * (%e / %e) = %e\n",rAr,new_rr,beta,alpha, rAr - new_rr * (beta / alpha) );
       #endif
       alpha = new_rr / pAp;
-      printf( " > beta = %e / %e = %e\n",new_rr,old_rr,beta );
-      printf( " > alpha = %e / %e = %e\n",new_rr,pAp,alpha );
+      //printf( " > beta = %e / %e = %e\n",new_rr,old_rr,beta );
+      //printf( " > alpha = %e / %e = %e\n",new_rr,pAp,alpha );
     }
     old_rr = new_rr;
 
@@ -330,8 +330,10 @@ int main(int argc, char *argv[]) {
       MPI_Allreduce(MPI_IN_PLACE, &rnorm, 1, MPI_DOUBLE, MPI_SUM,
                     MPI_COMM_WORLD);
       rnorm = std::sqrt(rnorm);
-      printf( "\n ====================================" );
-      printf( "\n rnorm=%e\n",rnorm );
+      if (myRank == 0) {
+        printf( "\n ====================================" );
+        printf( "\n rnorm=%e\n",rnorm );
+      }
     }
 
     // Compute Bytes and Flops

@@ -44,34 +44,169 @@
   https://mantevo.github.io/pdfs/MantevoOverview.pdf
 */
 
-#include <Kokkos_RemoteSpaces.hpp>
 #include <generate_matrix.hpp>
 #include <mpi.h>
 
-typedef Kokkos::Experimental::DefaultRemoteMemorySpace RemoteMemSpace_t;
-typedef Kokkos::View<double **, RemoteMemSpace_t> RemoteView_t;
 
-// MPI version (just a copy of above with different way of accessing x)
-template <class YType, class AType, class XType>
-void spmv_local(YType y, AType A, XType x) {
+// -------------------------------------------------------------
+// SpMV
+template <class YType, class HAType, class AType, class XType>
+struct cgsolve_spmv
+{
+  using integer_view_t = Kokkos::View<int *>;
+  using  scalar_view_t = Kokkos::View<double *>;
 
-  #ifdef KOKKOS_ENABLE_CUDA
-  int rows_per_team = 16;
-  int team_size = 16;
-  #else
-  int rows_per_team = 512;
-  int team_size = 1;
-  #endif
+  cgsolve_spmv(int n_, HAType h_A_, AType A_) :
+  n(n_),
+  h_A(h_A_),
+  A(A_)
+  {}
 
-  int vector_length = 8;
+  void setup() {
+    MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
+    MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
-  int64_t nrows = y.extent(0);
+    // global/local dimension
+    nlocal = (n + numRanks - 1) / numRanks;
 
-  auto policy =
+    // TODO: need to know if GPU-aware, and integer_view_t should be on device/host
+    // TODO: if GPU-aware, do setup on mirror view and deep-copy at the end?
+    // ----------------------------------------------------------
+    // find which elements to receive from which process
+    integer_view_t num_recvs("num_recvs", numRanks);
+    integer_view_t dsp_recvs("dsp_recvs", numRanks+1);
+    for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
+      for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
+        int p = h_A.col_idx(k) / nlocal;
+        if (p != myRank) {
+          num_recvs(p) ++;
+        }
+      }
+    }
+    int total_recvs = 0;
+    int num_neighbors = 0;
+    for (int p=0; p<numRanks; p++) {
+      if (num_recvs(p) > 0) {
+        total_recvs += num_recvs(p);
+        num_neighbors ++;
+      }
+      dsp_recvs(p+1) = dsp_recvs(p) + num_recvs(p);
+    }
+    integer_view_t map_recvs("map_recvs", numRanks);
+    ngb_recvs = integer_view_t("ngb_recvs", num_neighbors);
+    ptr_recvs = integer_view_t("ptr_recvs", num_neighbors+1);
+
+    num_neighbors = 0;
+    for (int p=0; p<numRanks; p++) {
+      if (num_recvs(p) > 0) {
+        ptr_recvs(num_neighbors+1) = ptr_recvs(num_neighbors) + num_recvs(p);
+        ngb_recvs(num_neighbors) = p;
+        map_recvs(p) = num_neighbors;
+        num_neighbors ++;
+      }
+    }
+    idx_recvs = integer_view_t("idx_recvs", total_recvs);
+    buf_recvs = scalar_view_t("buf_recvs", total_recvs);
+    for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
+      for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
+        int p = h_A.col_idx(k) / nlocal;
+        if (p != myRank) {
+          int owner = map_recvs(p);
+          idx_recvs(ptr_recvs(owner)) = h_A.col_idx(k);
+          ptr_recvs(owner) ++;
+        }
+      }
+    }
+    for (int p=num_neighbors; p > 0; p--) {
+      ptr_recvs(p) = ptr_recvs(p-1);
+    }
+    ptr_recvs(0) = 0;
+
+    // ----------------------------------------------------------
+    // find which elements to send to which process
+    integer_view_t num_sends("num_sends", numRanks);
+    integer_view_t dsp_sends("dsp_sends", numRanks+1);
+    MPI_Alltoall(&(num_recvs(0)), 1, MPI_INT, &(num_sends(0)), 1, MPI_INT, MPI_COMM_WORLD);
+    int total_sends = 0;
+    num_neighbors = 0;
+    for (int p=0; p<numRanks; p++) {
+      if (num_sends(p) > 0) {
+        total_sends += num_sends(p);
+        num_neighbors ++;
+      }
+      dsp_sends(p+1) = dsp_sends(p) + num_sends(p);
+    }
+    ngb_sends = integer_view_t("ngb_sends", num_neighbors);
+    ptr_sends = integer_view_t("ptr_sends", num_neighbors+1);
+    num_neighbors = 0;
+    for (int p=0; p<numRanks; p++) {
+      //printf( " > %d: num_sends(%d) = %d, num_recvs(%d) = %d\n",myRank,p,num_sends(p),p,num_recvs(p) );
+      if (num_sends(p) > 0) {
+        ptr_sends(num_neighbors+1) = ptr_sends(num_neighbors) + num_sends(p);
+        ngb_sends(num_neighbors) = p;
+        num_neighbors ++;
+      }
+      dsp_sends(p+1) = dsp_sends(p) + num_sends(p);
+    }
+    //printf( " %d: num_sends = %d, num_recvs = %d\n",myRank,ngb_sends.extent(0),ngb_recvs.extent(0) );
+
+    idx_sends = integer_view_t("idx_sends", total_sends);
+    buf_sends = scalar_view_t("buf_recvs", total_sends);
+    MPI_Alltoallv(&(idx_recvs(0)), &(num_recvs(0)), &(dsp_recvs(0)), MPI_INT,
+                  &(idx_sends(0)), &(num_sends(0)), &(dsp_sends(0)), MPI_INT,
+                  MPI_COMM_WORLD);
+    requests = (MPI_Request*)malloc(num_neighbors * sizeof(MPI_Request));
+
+  }
+
+  void exchange(XType x) {
+    // TODO: need to know if GPU-aware
+    int num_sends = ngb_sends.extent(0);
+    for (int q=0; q<num_sends; q++) {
+      int p = ngb_sends(q);
+      int start = ptr_sends(q);
+      int count = ptr_sends(q+1)-start;
+      for (int k=start; k<start+count; k++) {
+        buf_sends(k) = x(idx_sends(k));
+      }
+      //printf( " %d: MPI_Isend(count = %d, p = %d)\n",myRank,count,p );
+      MPI_Isend(&(buf_sends(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests[q]);
+    }
+
+    for (int q=0; q<ngb_recvs.extent(0); q++) {
+      int p = ngb_recvs(q);
+      int start = ptr_recvs(q);
+      int count = ptr_recvs(q+1)-start;
+
+      MPI_Status stat;
+      //printf( " %d: MPI_Irecv(count = %d, p = %d)\n",myRank,count,p );
+      MPI_Recv(&(buf_recvs(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &stat);
+
+      for (int k=start; k<start+count; k++) {
+        x(idx_recvs(k)) = buf_recvs(k);
+      }
+    }
+    MPI_Waitall(num_sends, requests, MPI_STATUSES_IGNORE);
+  }
+
+  void local_apply(YType y, XType x) {
+    #ifdef KOKKOS_ENABLE_CUDA
+    int rows_per_team = 16;
+    int team_size = 16;
+    #else
+    int rows_per_team = 512;
+    int team_size = 1;
+    #endif
+
+    int vector_length = 8;
+
+    int64_t nrows = y.extent(0);
+
+    auto policy =
       require(Kokkos::TeamPolicy<>((nrows + rows_per_team - 1) / rows_per_team,
                                    team_size, vector_length),
               Kokkos::Experimental::WorkItemProperty::HintHeavyWeight);
-  Kokkos::parallel_for(
+    Kokkos::parallel_for(
       "spmv", policy,
       KOKKOS_LAMBDA(const Kokkos::TeamPolicy<>::member_type &team) {
         const int64_t first_row = team.league_rank() * rows_per_team;
@@ -90,18 +225,48 @@ void spmv_local(YType y, AType A, XType x) {
                   Kokkos::ThreadVectorRange(team, row_length),
                   [=](const int64_t i, double &sum) {
                     int64_t idx = A.col_idx(i + row_start);
-                    int64_t pid = idx / MASK;
-                    int64_t offset = idx % MASK;
-                    //printf( " (row=%d, col=%d): %e * %e (pid=%d, offset=%d, MASK=%d)\n",(int)row,(int)idx,A.values(i + row_start), x(pid), (int)pid, (int)offset, (int)MASK );
-                    sum += A.values(i + row_start) * x(offset);
+                    //if (myRank == 0) {
+                    //  printf( " (row=%d, col=%d): %e * %e (idx=%d)\n",
+                    //         (int)row,(int)idx,A.values(i + row_start), x(idx), (int)idx );
+                    //}
+                    sum += A.values(i + row_start) * x(idx);
                   },
                   y_row);
-                  //printf( " -> y(%d) = %e\n\n",row,y_row );
+                  //if (myRank == 0) {
+                  //  printf( " -> y(%d) = %e\n\n",row,y_row );
+                  //}
               y(row) = y_row;
             });
       });
-}
+  }
 
+  void apply(YType y, XType x) {
+    this->exchange(x);
+    this->local_apply(y, x);
+  }
+
+private:
+  int n, nlocal;
+  AType A;
+  HAType h_A;
+
+  int myRank, numRanks;
+  MPI_Request *requests;
+
+  integer_view_t ngb_recvs; // store proc id of neighbors
+  integer_view_t ptr_recvs; // pointer to the begining of idx_recvs for each neighbor
+  integer_view_t idx_recvs; // store col indices of elements to receive
+  scalar_view_t  buf_recvs;
+
+  integer_view_t ngb_sends; // store proc id of neighbors
+  integer_view_t ptr_sends; // pointer to the begining of idx_recvs for each neighbor
+  integer_view_t idx_sends; // store col indices of elements to receive
+  scalar_view_t  buf_sends;
+};
+
+
+// -------------------------------------------------------------
+// dot
 template <class YType, class XType> double dot(YType y, XType x) {
   double result = 0.0;
   Kokkos::parallel_reduce(
@@ -111,6 +276,9 @@ template <class YType, class XType> double dot(YType y, XType x) {
   return result;
 }
 
+
+// -------------------------------------------------------------
+// axpby
 template <class ZType, class YType, class XType>
 void axpby(ZType z, double alpha, XType x, double beta, YType y) {
   int64_t n = z.extent(0);
@@ -119,25 +287,16 @@ void axpby(ZType z, double alpha, XType x, double beta, YType y) {
       KOKKOS_LAMBDA(const int &i) { z(i) = alpha * x(i) + beta * y(i); });
 }
 
-template <class VType> void print_vector(int label, VType v) {
-  std::cout << "\n\nPRINT " << v.label() << std::endl << std::endl;
 
-  int myRank = 0;
-  Kokkos::parallel_for(
-      v.extent(0), KOKKOS_LAMBDA(const int i) {
-        printf("%i %i %i %lf\n", label, myRank, i, v(i));
-      });
-  Kokkos::fence();
-  std::cout << "\n\nPRINT DONE " << v.label() << std::endl << std::endl;
-}
-
-template <class VType, class AType>
-int cg_solve(VType x, AType A, VType b,
-             //VType Ar,  PType Ar_global,
+// -------------------------------------------------------------
+// cg_solve
+template <class VType, class OP>
+int cg_solve(VType x, OP op, VType b,
              VType Ar, VType Ar_global,
              int max_iter, double tolerance) {
-  int myproc = 0;
-  MPI_Comm_rank(MPI_COMM_WORLD, &myproc);
+  int myRank, numRanks;
+  MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
+  MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
   int num_iters = 0;
 
   const double one = 1.0;
@@ -166,8 +325,8 @@ int cg_solve(VType x, AType A, VType b,
   VType AAr("AAr", x.extent(0));
 
   // r = b - A*x
-  axpby(Ar, zero, x, one, x);     // Ar = x
-  spmv_local(AAr, A, Ar_global);  // AAr = A*Ar
+  axpby(Ar, zero, x, one, x);   // Ar = x
+  op.apply(AAr, Ar_global);     // AAr = A*Ar
   axpby(r, one, b, -one, AAr);  // r = b-AAr
 
   //printf("Init: x, Ax, b, r\n" );
@@ -181,14 +340,14 @@ int cg_solve(VType x, AType A, VType b,
   normr = std::sqrt(beta);
 
   bool verbose = true;
-  if (verbose && myproc == 0) {
+  if (verbose && myRank == 0) {
     std::cout << "Initial Residual = " << normr << std::endl;
   }
   double brkdown_tol = std::numeric_limits<double>::epsilon();
 
   // Ar = A*r 
   axpby(Ar, one, r, zero, r);      // Ar = r
-  spmv_local(AAr, A, Ar_global);   // AAr = A*Ar
+  op.apply(AAr, Ar_global);        // AAr = A*Ar
   axpby(Ar, one, AAr, zero, AAr);  // Ar = AAr
 
   for (int64_t k = 1; k <= max_iter && normr > tolerance; ++k) {
@@ -202,14 +361,14 @@ int cg_solve(VType x, AType A, VType b,
                   MPI_COMM_WORLD);
 
     // AAr = A*Ar
-    spmv_local(AAr, A, Ar_global);
+    op.apply(AAr, Ar_global);
 
     // synch dots
     // ...
 
     // normr = sqrt(rtrans)
     normr = std::sqrt(new_rr);
-    if (verbose && myproc == 0) {
+    if (verbose && myRank == 0) {
       std::cout << "Iteration = " << k << "   Residual = " << normr
                 << std::endl;
     }
@@ -217,7 +376,7 @@ int cg_solve(VType x, AType A, VType b,
     // compute beta and alpha
     if (k == 1) {
       alpha = new_rr / rAr;
-      printf( " > alpha = %e / %e = %e\n",new_rr,rAr,alpha );
+      //printf( " > alpha = %e / %e = %e\n",new_rr,rAr,alpha );
       beta = zero;
     } else {
       #if 0
@@ -227,11 +386,11 @@ int cg_solve(VType x, AType A, VType b,
       #else
       beta = new_rr / old_rr;
       pAp = rAr - new_rr * (beta / alpha);
-      printf( " > pap = %e - %e * (%e / %e) = %e\n",rAr,new_rr,beta,alpha, rAr - new_rr * (beta / alpha) );
+      //printf( " > pap = %e - %e * (%e / %e) = %e\n",rAr,new_rr,beta,alpha, rAr - new_rr * (beta / alpha) );
       #endif
       alpha = new_rr / pAp;
-      printf( " > beta = %e / %e = %e\n",new_rr,old_rr,beta );
-      printf( " > alpha = %e / %e = %e\n",new_rr,pAp,alpha );
+      //printf( " %d:%d: > beta = %e / %e = %e\n",myRank,k,new_rr,old_rr,beta );
+      //printf( " %d:%d: > alpha = %e / %e = %e\n",myRank,k,new_rr,pAp,alpha );
     }
     old_rr = new_rr;
 
@@ -277,6 +436,10 @@ int main(int argc, char *argv[]) {
   nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
 #endif
 
+  using  VType = Kokkos::View<double *>;
+  using  AType = CrsMatrix<Kokkos::DefaultExecutionSpace::memory_space>;
+  using HAType = CrsMatrix<Kokkos::HostSpace>;
+
   Kokkos::initialize(argc, argv);
   {
     int N = argc > 1 ? atoi(argv[1]) : 100;
@@ -285,56 +448,80 @@ int main(int argc, char *argv[]) {
 
     using default_execution_space = Kokkos::DefaultExecutionSpace;
     using default_memory_space = typename default_execution_space::memory_space;
-    std::cout << std::endl;
-    std::cout << "Default execution space: " << default_execution_space::name () << std::endl;
-    std::cout << "Default memory space   : " << default_memory_space::name () << std::endl;
-    std::cout << std::endl;
+    if (myRank == 0) {
+      std::cout << std::endl;
+      std::cout << "Default execution space: " << default_execution_space::name () << std::endl;
+      std::cout << "Default memory space   : " << default_memory_space::name () << std::endl;
+      std::cout << "Number of processes    : " << numRanks << std::endl;
+      std::cout << std::endl;
+    }
 
     // generate matrix on host
-    CrsMatrix<Kokkos::HostSpace> h_A = Impl::generate_miniFE_matrix(N);
+    HAType h_A = Impl::generate_miniFE_matrix(N);
+    // generate rhs
+    Kokkos::View<double *, Kokkos::HostSpace> h_b =
+        Impl::generate_miniFE_vector(N);
+    // global/local dimension
+    int n = h_b.extent(0);
+    int nlocal = (n + numRanks - 1) / numRanks;
+
+    // convert the column indexes to "standard" global indexes
+    for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
+      for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
+        int p = h_A.col_idx(k) / MASK;
+        int idx = h_A.col_idx(k) % MASK;
+        int64_t start_row = p * nlocal;
+        h_A.col_idx(k) = start_row + idx;
+      }
+    }
+
     // copy the matrix to device
     Kokkos::View<int64_t *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
     Kokkos::View<int64_t *> col_idx("col_idx", h_A.col_idx.extent(0));
     Kokkos::View<double  *>  values("values",  h_A.values.extent(0));
-    CrsMatrix<Kokkos::DefaultExecutionSpace::memory_space> A(
-        row_ptr, col_idx, values, h_A.num_cols());
+    AType A(row_ptr, col_idx, values, h_A.num_cols());
     Kokkos::deep_copy(A.row_ptr, h_A.row_ptr);
     Kokkos::deep_copy(A.col_idx, h_A.col_idx);
     Kokkos::deep_copy(A.values,  h_A.values);
 
-    // generate rhs
-    Kokkos::View<double *, Kokkos::HostSpace> h_b =
-        Impl::generate_miniFE_vector(N);
-    // copy rhs too device
-    Kokkos::View<double *> b("b", h_b.extent(0));
+    // copy rhs to device
+    VType b("b", h_b.extent(0));
     Kokkos::deep_copy(b, h_b);
 
-/*Kokkos::fence();
-printf( " A = [\n" );
-for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
-  for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) printf( "%d %d %.16e %d\n",i,h_A.col_idx(k), h_A.values(k), k );
-}
-printf("];\n");*/
+    //Kokkos::fence();
+    char filename[200];
+    FILE *fp;
+    sprintf(filename,"A%d_%d.dat",numRanks, myRank);
+    fp = fopen(filename, "w");
+    for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
+      for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++)
+        fprintf(fp, "%d %d %.16e %d\n",i,h_A.col_idx(k), h_A.values(k), k );
+    }
+    fclose(fp);
 
     // global
-    int n = h_b.extent(0);
-    int nlocal = (h_b.extent(0) + numRanks - 1) / numRanks;
     int64_t start_row = myRank * nlocal;
     int64_t end_row = (myRank + 1) * nlocal;
     if (end_row > n)
       end_row = n;
 
-    // CG
+    // local rhs on device
     Kokkos::pair<int64_t, int64_t> bounds(start_row, end_row);
-    Kokkos::View<double *> b_sub = Kokkos::subview(b, bounds);
-    Kokkos::View<double *> x_sub("x", b_sub.extent(0));
+    VType b_sub = Kokkos::subview(b, bounds);
+    // local sol on device
+    VType x_sub("x", b_sub.extent(0));
 
     // input vector for SpMV
-    Kokkos::View<double *> p("p", n); // global
-    Kokkos::View<double *> p_sub = Kokkos::subview(p, bounds); // local
+    VType p("p", n); // global
+    VType p_sub = Kokkos::subview(p, bounds); // local
 
+    // setup SpMV
+    cgsolve_spmv<VType, HAType, AType, VType> op (n, h_A, A);
+    op.setup();
+
+    // call CG
     Kokkos::Timer timer;
-    int num_iters = cg_solve(x_sub, A, b_sub,
+    int num_iters = cg_solve(x_sub, op, b_sub,
                              p_sub, p,
                              max_iter, tolerance);
     double time = timer.seconds();
@@ -342,10 +529,9 @@ printf("];\n");*/
     {
       const double one = 1.0;
       const double zero = 0.0;
-      Kokkos::View<double *> r("Y", x_sub.extent(0));
-      Kokkos::View<double *> q(p.data(), x_sub.extent(0));
-      axpby(q, one, x_sub, zero, x_sub);
-      spmv_local(r, A, p);
+      VType r("Y", x_sub.extent(0));
+      axpby(p_sub, one, x_sub, zero, x_sub);
+      op.apply(r, p);
       axpby(r, -one, r, one, b_sub);
       //for (int i = 0; i < r.extent(0); i++) printf( "%d %e %e %e\n",i,b_sub(i),x_sub(i),r(i));
 
@@ -353,8 +539,10 @@ printf("];\n");*/
       MPI_Allreduce(MPI_IN_PLACE, &rnorm, 1, MPI_DOUBLE, MPI_SUM,
                     MPI_COMM_WORLD);
       rnorm = std::sqrt(rnorm);
-      printf( "\n ====================================" );
-      printf( "\n rnorm=%e\n",rnorm );
+      if (myRank == 0) {
+        printf( "\n ====================================" );
+        printf( "\n rnorm=%e\n",rnorm );
+      }
     }
 
     // Compute Bytes and Flops
