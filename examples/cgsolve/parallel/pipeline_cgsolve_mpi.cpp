@@ -106,6 +106,7 @@ struct cgsolve_spmv
     host_ngb_recvs = Kokkos::create_mirror_view(ngb_recvs);
     host_ptr_recvs = Kokkos::create_mirror_view(ptr_recvs);
 
+    max_num_recvs = 0;
     num_neighbors = 0;
     for (int p=0; p<numRanks; p++) {
       if (num_recvs(p) > 0) {
@@ -113,6 +114,8 @@ struct cgsolve_spmv
         host_ngb_recvs(num_neighbors) = p;
         map_recvs(p) = num_neighbors;
         num_neighbors ++;
+
+        max_num_recvs = (num_recvs(p) > max_num_recvs ? num_recvs(p) : max_num_recvs);
       }
     }
     buf_recvs = buffer_view_t ("buf_recvs", total_recvs);
@@ -157,12 +160,15 @@ struct cgsolve_spmv
     host_ptr_sends = Kokkos::create_mirror_view(ptr_sends);
 
     num_neighbors = 0;
+    max_num_sends = 0;
     for (int p=0; p<numRanks; p++) {
       //printf( " > %d: num_sends(%d) = %d, num_recvs(%d) = %d\n",myRank,p,num_sends(p),p,num_recvs(p) );
       if (num_sends(p) > 0) {
         host_ptr_sends(num_neighbors+1) = host_ptr_sends(num_neighbors) + num_sends(p);
         host_ngb_sends(num_neighbors) = p;
         num_neighbors ++;
+
+        max_num_sends = (num_sends(p) > max_num_sends ? num_sends(p) : max_num_sends);
       }
       dsp_sends(p+1) = dsp_sends(p) + num_sends(p);
     }
@@ -174,6 +180,13 @@ struct cgsolve_spmv
     MPI_Alltoallv(&(host_idx_recvs(0)), &(num_recvs(0)), &(dsp_recvs(0)), MPI_INT,
                   &(host_idx_sends(0)), &(num_sends(0)), &(dsp_sends(0)), MPI_INT,
                   MPI_COMM_WORLD);
+    /*if (myRank == 0) {
+      for (int p = 0; p <num_neighbors; p++) {
+        for (int k = host_ptr_sends(p); k < host_ptr_sends(p+1); k++) {
+          printf("%d %d\n",p,host_idx_sends(k) );
+        }
+      }
+    }*/
 
     Kokkos::deep_copy(ptr_sends, host_ptr_sends);
     Kokkos::deep_copy(idx_sends, host_idx_sends);
@@ -193,6 +206,21 @@ struct cgsolve_spmv
     timer.reset();
     #endif
     int num_sends = ngb_sends.extent(0);
+    #if 1
+    Kokkos::parallel_for(team_policy_type(max_num_sends, Kokkos::AUTO),
+      KOKKOS_LAMBDA(const member_type & team) {
+        int k = team.league_rank();
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(team, 0, num_sends),
+          [&](const int q) {
+            int p = ngb_sends(q);
+            int start = ptr_sends(q);
+            int count = ptr_sends(q+1)-start;
+            if(k < count) {
+              buf_sends(start+k) = x(idx_sends(start+k));
+            }
+          });
+      });
+    #else
     Kokkos::parallel_for(team_policy_type(num_sends, Kokkos::AUTO),
       KOKKOS_LAMBDA(const member_type & team) {
         int q = team.league_rank();
@@ -204,6 +232,7 @@ struct cgsolve_spmv
             buf_sends(start+k) = x(idx_sends(start+k));
           });
       });
+    #endif
     Kokkos::fence();
     #if defined(CGSOLVE_TIMER)
     time_comm_pack = timer.seconds();
@@ -277,6 +306,21 @@ struct cgsolve_spmv
     #if defined(CGSOLVE_TIMER)
     timer.reset();
     #endif
+    #if 1
+    Kokkos::parallel_for(team_policy_type(max_num_recvs, Kokkos::AUTO),
+      KOKKOS_LAMBDA(const member_type & team) {
+        int k = team.league_rank();
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(team, 0, num_recvs),
+          [&](const int q) {
+            int p = ngb_recvs(q);
+            int start = ptr_recvs(q);
+            int count = ptr_recvs(q+1)-start;
+            if (k < count) {
+              x(idx_recvs(start+k)) = buf_recvs(start+k);
+            }
+          });
+      });
+    #else
     Kokkos::parallel_for(team_policy_type(num_recvs, Kokkos::AUTO),
       KOKKOS_LAMBDA(const member_type & team) {
         int q = team.league_rank();
@@ -288,6 +332,7 @@ struct cgsolve_spmv
             x(idx_recvs(start+k)) = buf_recvs(start+k);
           });
       });
+    #endif
     Kokkos::fence();
     #if defined(CGSOLVE_TIMER)
     time_comm_unpack = timer.seconds();
@@ -393,11 +438,13 @@ private:
   int myRank, numRanks;
   MPI_Request *requests;
 
+  int max_num_recvs;
   buffer_view_t  buf_recvs;
   integer_view_t ngb_recvs; // store proc id of neighbors
   integer_view_t ptr_recvs; // pointer to the begining of idx_recvs for each neighbor
   integer_view_t idx_recvs; // store col indices of elements to receive
 
+  int max_num_sends;
   buffer_view_t  buf_sends;
   integer_view_t ngb_sends; // store proc id of neighbors
   integer_view_t ptr_sends; // pointer to the begining of idx_recvs for each neighbor
