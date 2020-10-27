@@ -184,7 +184,7 @@ int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
   if (verbose && myproc == 0) {
     std::cout << "Initial Residual = " << normr << std::endl;
   }
-  double brkdown_tol = std::numeric_limits<double>::epsilon();
+  //double brkdown_tol = std::numeric_limits<double>::epsilon();
 
   // Ar = A*r 
   axpby(Ar, one, r, zero, r);      // Ar = r
