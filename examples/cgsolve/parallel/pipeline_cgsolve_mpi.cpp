@@ -219,7 +219,6 @@ struct cgsolve_spmv
     }
     #endif
     int num_sends = ngb_sends.extent(0);
-    #if 1
     Kokkos::parallel_for(team_policy_type(max_num_sends, Kokkos::AUTO),
       KOKKOS_LAMBDA(const member_type & team) {
         int k = team.league_rank();
@@ -233,19 +232,6 @@ struct cgsolve_spmv
             }
           });
       });
-    #else
-    Kokkos::parallel_for(team_policy_type(num_sends, Kokkos::AUTO),
-      KOKKOS_LAMBDA(const member_type & team) {
-        int q = team.league_rank();
-        int p = ngb_sends(q);
-        int start = ptr_sends(q);
-        int count = ptr_sends(q+1)-start;
-        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(team, 0, count),
-          [&](const int k) {
-            buf_sends(start+k) = x(idx_sends(start+k));
-          });
-      });
-    #endif
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       Kokkos::fence();
@@ -320,7 +306,6 @@ struct cgsolve_spmv
 
     // unpack on device
     int num_recvs = ngb_recvs.extent(0);
-    #if 1
     Kokkos::parallel_for(team_policy_type(max_num_recvs, Kokkos::AUTO),
       KOKKOS_LAMBDA(const member_type & team) {
         int k = team.league_rank();
@@ -334,19 +319,6 @@ struct cgsolve_spmv
             }
           });
       });
-    #else
-    Kokkos::parallel_for(team_policy_type(num_recvs, Kokkos::AUTO),
-      KOKKOS_LAMBDA(const member_type & team) {
-        int q = team.league_rank();
-        int p = ngb_recvs(q);
-        int start = ptr_recvs(q);
-        int count = ptr_recvs(q+1)-start;
-        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(team, 0, count),
-          [&](const int k) {
-            x(idx_recvs(start+k)) = buf_recvs(start+k);
-          });
-      });
-    #endif
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       Kokkos::fence();
@@ -537,8 +509,11 @@ void axpby(ZType z, double alpha, XType x, double beta, YType y) {
 template <class VType, class OP>
 int cg_solve(VType x, OP op, VType b,
              VType Ar, VType Ar_global,
-             int max_iter, double tolerance, bool verbose,
-             bool time_spmv_on, bool time_idot_on) {
+             int max_iter, double tolerance, int idot_option,
+             bool verbose, bool time_spmv_on, bool time_idot_on) {
+
+  MPI_Request request;
+  MPI_Status status;
   int myRank, numRanks;
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
   MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
@@ -561,6 +536,7 @@ int cg_solve(VType x, OP op, VType b,
   Kokkos::Timer timer_idot;
   double time_idot = 0.0;
   double time_idot_comm = 0.0;
+  double time_idot_wait = 0.0;
 
 
   double normr = 0.0;
@@ -634,16 +610,19 @@ int cg_solve(VType x, OP op, VType b,
 
   // beta = r'*r
   #if defined(CGSOLVE_GPU_AWARE_MPI)
-  //dot(r, r, dot1_result);
-  //MPI_Allreduce(MPI_IN_PLACE, dot1_result.data(), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-  //Kokkos::deep_copy(dot1_host, dot1_result);
-  //beta = (dot1_host.data())[0];
-  //cgsolve_dot<VType, VType, DType> dot_func(r, r, dot_atomic);
-  //Kokkos::parallel_for (Kokkos::RangePolicy<>(0, r.extent(0)), dot_func);
-  //Kokkos::deep_copy(dot_host, dot_atomic);
-  //beta = (dot_host.data())[0];
-  dot(r, beta);
+   #if defined(CGSOLVE_ENABLE_CUBLAS)
+   cublasDdot(cublasHandle, nloc, &(dataR[0]), 1, &(dataR[0]), 1, &(dotResult[0]));
+   MPI_Allreduce(MPI_IN_PLACE, &(dotResult[0]), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   Kokkos::deep_copy(dot_host, dot_result); // copy not-needed dot_result(1), too
+   beta = dot_host(0);
+   #else
+   dot(r, r, dot1_result);
+   MPI_Allreduce(MPI_IN_PLACE, dot1_result.data(), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   Kokkos::deep_copy(dot1_host, dot1_result);
+   beta = (dot1_host.data())[0];
+   #endif
   #else
+  //printf( " beta = %e\n",beta );
   dot(r, r, beta);
   MPI_Allreduce(MPI_IN_PLACE, &beta, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   #endif
@@ -678,31 +657,28 @@ int cg_solve(VType x, OP op, VType b,
 
   int num_iters = 0;
   for (int64_t k = 1; k <= max_iter && normr > tolerance; ++k) {
-    // beta = r'*r
     if (time_idot_on) {
       Kokkos::fence();
       timer_idot.reset();
     }
+
     #if defined(CGSOLVE_GPU_AWARE_MPI)
      #if defined(CGSOLVE_ENABLE_CUBLAS)
+     // beta = r'*r
      cublasDdot(cublasHandle, nloc, &(dataR[0]), 1, &(dataR[0]), 1, &(dotResult[0]));
-     #else
-     dot(r, dot1_result);
-     #endif
-    #else
-    dot(r, r, new_rr);
-    #endif
-
-
-    // rAr = r'*Ar
-    #if defined(CGSOLVE_GPU_AWARE_MPI)
-     #if defined(CGSOLVE_ENABLE_CUBLAS)
+     // rAr = r'*Ar
      cublasDdot(cublasHandle, nloc, &(dataR[0]), 1, &(dataAR[0]), 1, &(dotResult[1]));
      #else
+     // beta = r'*r
+     dot(r, dot1_result);
+     // rAr = r'*Ar
      dot(r, Ar, dot2_result);
      #endif
     #else
-    dot(r, Ar, rAr);
+     // beta = r'*r
+     dot(r, r, new_rr);
+     // rAr = r'*Ar
+     dot(r, Ar, rAr);
     #endif
     // fence before calling MPI
     Kokkos::fence();
@@ -715,18 +691,28 @@ int cg_solve(VType x, OP op, VType b,
     Kokkos::deep_copy(dotResult1, dot1_dev);
     Kokkos::deep_copy(dotResult2, dot2_dev);
     #endif
-    MPI_Allreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
-                  MPI_COMM_WORLD);
-    Kokkos::deep_copy(dot_host, dot_result);
-    new_rr = dot_host(0);
-    rAr = dot_host(1);
+    if (idot_option == 1) {
+      MPI_Iallreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
+                     MPI_COMM_WORLD, &request);
+    } else {
+      MPI_Allreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
+                    MPI_COMM_WORLD);
+      Kokkos::deep_copy(dot_host, dot_result);
+      new_rr = dot_host(0);
+      rAr = dot_host(1);
+    }
     #else
     dot_host(0) = new_rr;
     dot_host(1) = rAr;
-    MPI_Allreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
-                  MPI_COMM_WORLD);
-    new_rr = dot_host(0);
-    rAr = dot_host(1);
+    if (idot_option == 1) {
+      MPI_Iallreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
+                     MPI_COMM_WORLD, &request);
+    } else {
+      MPI_Allreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
+                    MPI_COMM_WORLD);
+      new_rr = dot_host(0);
+      rAr = dot_host(1);
+    }
     #endif
     if (time_idot_on) {
       time_idot_comm += timer_idot.seconds();
@@ -752,25 +738,38 @@ int cg_solve(VType x, OP op, VType b,
     }
 
     // synch dots
-    // ...
+    if (time_idot_on) {
+      timer_idot.reset();
+    }
+    if (idot_option == 1) {
+      MPI_Wait(&request, &status);
+      #if defined(CGSOLVE_GPU_AWARE_MPI)
+      Kokkos::deep_copy(dot_host, dot_result);
+      new_rr = dot_host(0);
+      rAr = dot_host(1);
+      #else
+      new_rr = dot_host(0);
+      rAr = dot_host(1);
+      #endif
+    }
+    if (time_idot_on) {
+      time_idot_wait += timer_idot.seconds();
+    }
 
     // normr = sqrt(rtrans)
     normr = std::sqrt(new_rr);
-    if (verbose && myRank == 0) {
-      std::cout << "Iteration = " << k << "   Residual = " << normr
-                << std::endl;
-    }
 
     // compute beta and alpha
     if (k == 1) {
       alpha = new_rr / rAr;
       //printf( " > alpha = %e / %e = %e\n",new_rr,rAr,alpha );
       beta = zero;
+      pAp = zero;
     } else {
       #if 0
-      pAp = new_rr - beta*beta*alpha;
       beta = new_rr / old_rr;
-      printf( " > pap = %e - %e * %e * %e = %e\n",new_rr, beta,beta,alpha, pAp);
+      pAp = rAr + beta*beta*pAp;
+      //printf( " > pap = %e - %e * %e * %e = %e\n",new_rr, beta,beta,alpha, pAp);
       #else
       beta = new_rr / old_rr;
       pAp = rAr - new_rr * (beta / alpha);
@@ -779,6 +778,11 @@ int cg_solve(VType x, OP op, VType b,
       alpha = new_rr / pAp;
       //printf( " %d:%d: > beta = %e / %e = %e\n",myRank,k,new_rr,old_rr,beta );
       //printf( " %d:%d: > alpha = %e / %e = %e\n",myRank,k,new_rr,pAp,alpha );
+    }
+    if (verbose && myRank == 0) {
+      std::cout << "Iteration = " << k << "   Residual = " << normr
+                << " beta = " << beta << ", alpha = " << alpha
+                << std::endl;
     }
     old_rr = new_rr;
 
@@ -845,7 +849,7 @@ int cg_solve(VType x, OP op, VType b,
         printf( "     > time(SpMV)::unpack  =  %.2e ~ %.2e seconds\n",min_unpack,max_unpack );
         printf( "     > time(SpMV)::mpi     =  %.2e ~ %.2e seconds\n",min_mpi,   max_mpi  );
         #endif
-        printf( "    + time(SpMV)::spmv    =  %.2e ~ %.2e seconds\n",min_comp,  max_comp );
+        printf( "    + time(SpMV)::comp    =  %.2e ~ %.2e seconds\n",min_comp,  max_comp );
       }
     }
     if (time_idot_on) {
@@ -855,10 +859,15 @@ int cg_solve(VType x, OP op, VType b,
       double min_dot_comm = 0.0, max_dot_comm = 0.0;
       MPI_Allreduce(&time_idot_comm, &min_dot_comm, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
       MPI_Allreduce(&time_idot_comm, &max_dot_comm, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+      double min_dot_wait = 0.0, max_dot_wait = 0.0;
+      MPI_Allreduce(&time_idot_wait, &min_dot_wait, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+      MPI_Allreduce(&time_idot_wait, &max_dot_wait, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
       if (myRank == 0) {
-        printf( "   time(iDot)          = %.2e seconds\n", time_idot+time_idot_comm );
+        printf( "   time(iDot)          = %.2e + %.2e + %.2e = %.2e seconds\n", time_idot,time_idot_comm,time_idot_wait,
+                                                                                time_idot+time_idot_comm+time_idot_wait );
         printf( "    + time(iDot)::comp  =  %.2e ~ %.2e seconds\n",min_dot_comp,max_dot_comp );
         printf( "    + time(iDot)::comm  =  %.2e ~ %.2e seconds\n",min_dot_comm,max_dot_comm );
+        printf( "    + time(iDot)::wait  =  %.2e ~ %.2e seconds\n",min_dot_wait,max_dot_wait );
       }
     }
     if (myRank == 0) {
@@ -887,6 +896,7 @@ int main(int argc, char *argv[]) {
     int N            = 100;
     int max_iter     = 200;
     double tolerance = 1e-9;
+    int idot_option  = 0;
     bool verbose     = false;
     bool time_idot   = false;
     bool time_spmv   = false;
@@ -897,6 +907,10 @@ int main(int argc, char *argv[]) {
       }
       if((strcmp(argv[i],"-iter")==0)) {
         max_iter = atoi(argv[++i]);
+        continue;
+      }
+      if((strcmp(argv[i],"-idot")==0)) {
+        idot_option = atoi(argv[++i]);
         continue;
       }
       if((strcmp(argv[i],"-v")==0)) {
@@ -991,14 +1005,15 @@ int main(int argc, char *argv[]) {
       int64_t nloc = end_row - start_row;
       int64_t nnz = h_A.row_ptr(nloc);
       std::cout << " calling cg_solve ( N = " << N << " nloc = " << nloc
-                << " nnz/nloc = " << double(nnz)/double(nloc) << " )" << std::endl;
+                << " nnz/nloc = " << double(nnz)/double(nloc)
+                << ", idot = " << idot_option << " )" << std::endl;
     }
     Kokkos::fence();
     Kokkos::Timer timer;
     int num_iters = cg_solve(x_sub, op, b_sub,
                              p_sub, p,
-                             max_iter, tolerance, verbose,
-                             time_spmv, time_idot);
+                             max_iter, tolerance, idot_option,
+                             verbose, time_spmv, time_idot);
     double time = timer.seconds();
 
     {
