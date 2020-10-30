@@ -67,6 +67,8 @@ template <class MemSpace> struct CrsMatrix {
   KOKKOS_INLINE_FUNCTION
   int64_t nnz() const { return values.extent(0); }
 
+  CrsMatrix() {}
+
   CrsMatrix(Kokkos::View<int64_t *, MemSpace> row_ptr_,
             Kokkos::View<LOCAL_ORDINAL *, MemSpace> col_idx_,
             Kokkos::View<double *, MemSpace> values_, int64_t num_cols_)
