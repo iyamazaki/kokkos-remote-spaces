@@ -138,19 +138,6 @@ struct cgsolve_spmv
         max_num_recvs = (host_num_recvs(p) > max_num_recvs ? host_num_recvs(p) : max_num_recvs);
       }
     }
-    //#define OPTIMIZE
-    #if defined(OPTIMIZE)
-    // allocate for max_num_recvs, to avoid if in 
-    num_neighbors_recvs = 0;
-    for (int p = 0; p < numRanks; p++) {
-      if (host_num_recvs(p) > 0) {
-        num_neighbors_recvs ++;
-        host_ptr_recvs(num_neighbors_recvs) = num_neighbors_recvs*max_num_recvs;
-      }
-      dsp_recvs(p+1) = num_neighbors_recvs*max_num_recvs;
-    }
-    total_recvs = max_num_recvs * num_neighbors_recvs;
-    #endif
     buf_recvs = buffer_view_t ("buf_recvs", total_recvs);
     idx_recvs = integer_view_t("idx_recvs", total_recvs);
     host_idx_recvs = Kokkos::create_mirror_view(idx_recvs);
@@ -169,33 +156,10 @@ struct cgsolve_spmv
         }
       }
     }
-    #if defined(OPTIMIZE)
-    for (int p = 0; p < num_neighbors_recvs; p++) {
-      // set the remaining to the last element to send (redandunt)
-      for (int k = host_ptr_recvs(p); k < (1+p)*max_num_recvs; k++) {
-        host_idx_recvs(k) = host_idx_recvs(host_ptr_recvs(p)-1);
-      }
-      host_ptr_recvs(p) = p*max_num_recvs;
-    }
-    #else
     for (int p = num_neighbors_recvs; p > 0; p--) {
       host_ptr_recvs(p) = host_ptr_recvs(p-1);
     }
     host_ptr_recvs(0) = 0;
-    #endif
-/*if (myRank == 1) {
-  printf( " max = %d\n",max_num_recvs );
-  for (int p = 0; p < num_neighbors_recvs; p++) {
-    printf( " > ptr[%d] = %d (%d), num[%d]=%d\n",p,host_ptr_recvs(p),host_ptr_recvs(p+1)-host_ptr_recvs(p), host_ngb_recvs(p),host_num_recvs(host_ngb_recvs(p)));
-    for (int k = host_ptr_recvs(p); k < host_ptr_recvs(p)+host_num_recvs(host_ngb_recvs(p)); k++) {
-      printf( " + %d %d %d\n",p,k,host_idx_recvs(k) );
-    }
-    for (int k = host_ptr_recvs(p)+host_num_recvs(host_ngb_recvs(p)); k < host_ptr_recvs(p+1); k++) {
-      printf( " - %d %d %d\n",p,k,host_idx_recvs(k) );
-    }
-    printf("\n");
-  }
-}*/
 
     Kokkos::deep_copy(num_recvs, host_num_recvs);
     Kokkos::deep_copy(ptr_recvs, host_ptr_recvs);
@@ -243,40 +207,6 @@ struct cgsolve_spmv
     MPI_Alltoallv(&(host_idx_recvs(0)), &(host_num_recvs(0)), &(dsp_recvs(0)), MPI_INT,
                   &(host_idx_sends(0)), &(num_sends(0)), &(dsp_sends(0)), MPI_INT,
                   MPI_COMM_WORLD);
-    /*{
-      char filename[200];
-      FILE *fp;
-      sprintf(filename,"send%d_%d.dat",numRanks, myRank);
-      fp = fopen(filename, "w");
-      for (int p = 0; p <host_ptr_sends.extent(0)-1; p++) {
-        int q = host_ngb_sends(p);
-        fprintf(fp,"%d: %d to %d\n",p,host_ptr_sends(p+1)-host_ptr_sends(p),q);
-      }
-      fprintf(fp,"\n");
-      for (int p = 0; p <host_ptr_sends.extent(0)-1; p++) {
-        int q = host_ngb_sends(p);
-        for (int k = host_ptr_sends(p); k < host_ptr_sends(p+1); k++) {
-          fprintf(fp," > send[%d,%d] = %d\n",p,q,host_idx_sends(k) );
-        }
-        fprintf(fp,"\n");
-      }
-      fclose(fp);
-
-      sprintf(filename,"recv%d_%d.dat",numRanks, myRank);
-      fp = fopen(filename, "w");
-      for (int p = 0; p <host_ptr_recvs.extent(0)-1; p++) {
-        int q = host_ngb_recvs(p);
-        fprintf(fp,"%d from %d\n",host_ptr_recvs(p+1)-host_ptr_recvs(p),q);
-      }
-      for (int p = 0; p <host_ptr_recvs.extent(0)-1; p++) {
-        int q = host_ngb_recvs(p);
-        for (int k = host_ptr_recvs(p); k < host_ptr_recvs(p+1); k++) {
-          fprintf(fp," > recv[%d,%d] = %d\n",p,q,host_idx_recvs(k) );
-        }
-        fprintf(fp,"\n");
-      }
-      fclose(fp);
-    }*/
     #if defined(CGSOLVE_SPMV_TIMER)
     if (myRank == 0) {
       for (int p = 0; p < numRanks; p ++) {
@@ -400,14 +330,11 @@ struct cgsolve_spmv
             int p = ngb_recvs(q);
             int start = ptr_recvs(q);
             int count = num_recvs(p); //ptr_recvs(q+1)-start;
-            #if defined(OPTIMIZE)
-            int id = (k < count ? start+k : start+count-1);
-            x(idx_recvs(id)) = buf_recvs(id);
-            #else
+            //int id = (k < count ? start+k : start+count-1);
+            //x(idx_recvs(id)) = buf_recvs(id);
             if (k < count) {
               x(idx_recvs(start+k)) = buf_recvs(start+k);
             }
-            #endif
           });
       });
     #if defined(CGSOLVE_SPMV_TIMER)
@@ -465,16 +392,9 @@ struct cgsolve_spmv
                   Kokkos::ThreadVectorRange(team, row_length),
                   [=](const int64_t i, double &sum) {
                     int64_t idx = A.col_idx(i + row_start);
-                    //if (myRank == 0) {
-                    //  printf( " (row=%d, col=%d): %e * %e (idx=%d)\n",
-                    //         (int)row,(int)idx,A.values(i + row_start), x(idx), (int)idx );
-                    //}
                     sum += A.values(i + row_start) * x(idx);
                   },
                   y_row);
-                  //if (myRank == 0) {
-                  //  printf( " -> y(%d) = %e\n\n",row,y_row );
-                  //}
               y(row) = y_row;
             });
       });
@@ -749,6 +669,9 @@ int cg_solve(VType x, OP op, VType b,
   }
   axpby(Ar, one, AAr, zero, AAr);  // Ar = AAr
 
+
+  // ---------------------------
+  // Main loop
   int num_iters = 0;
   for (int64_t k = 1; k <= max_iter && normr > tolerance; ++k) {
     if (time_idot_on) {
@@ -986,6 +909,8 @@ int main(int argc, char *argv[]) {
     int max_iter     = 200;
     double tolerance = 1e-9;
     int idot_option  = 0;
+    std::string matrixFilename {""};
+
     bool verbose     = false;
     bool time_idot   = false;
     bool time_spmv   = false;
@@ -1027,21 +952,27 @@ int main(int argc, char *argv[]) {
     }
 
     // generate matrix on host
-    HAType h_A = Impl::generate_miniFE_matrix(N);
-    // generate rhs
-    Kokkos::View<double *, Kokkos::HostSpace> h_b =
-        Impl::generate_miniFE_vector(N);
-    // global/local dimension
-    int n = h_b.extent(0);
-    int nlocal = (n + numRanks - 1) / numRanks;
+    int n = 0;
+    int nlocal = 0;
+    HAType h_A;
+    Kokkos::View<double *, Kokkos::HostSpace> h_b;
+    if (matrixFilename != "") {
+    } else {
+      h_A = Impl::generate_miniFE_matrix(N);
+      // generate rhs
+      h_b = Impl::generate_miniFE_vector(N);
+      // global/local dimension
+      n = h_b.extent(0);
+      nlocal = (n + numRanks - 1) / numRanks;
 
-    // convert the column indexes to "standard" global indexes
-    for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
-      for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
-        int p = h_A.col_idx(k) / MASK;
-        int idx = h_A.col_idx(k) % MASK;
-        int64_t start_row = p * nlocal;
-        h_A.col_idx(k) = start_row + idx;
+      // convert the column indexes to "standard" global indexes
+      for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
+        for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
+          int p = h_A.col_idx(k) / MASK;
+          int idx = h_A.col_idx(k) % MASK;
+          int64_t start_row = p * nlocal;
+          h_A.col_idx(k) = start_row + idx;
+        }
       }
     }
 
