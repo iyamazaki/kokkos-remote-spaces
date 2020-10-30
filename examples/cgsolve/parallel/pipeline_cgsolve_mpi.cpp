@@ -94,92 +94,142 @@ struct cgsolve_spmv
 
     // ----------------------------------------------------------
     // find which elements to receive from which process
-    host_integer_view_t num_recvs("num_recvs", numRanks);
-    host_integer_view_t dsp_recvs("dsp_recvs", numRanks+1);
+    const double zero = 0.0;
+
+    num_recvs = integer_view_t("num_recvs", numRanks);
+    host_num_recvs = Kokkos::create_mirror_view(num_recvs);
+    host_integer_view_t check("check", n);
+    Kokkos::deep_copy(check, 0);
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
         int p = h_A.col_idx(k) / nlocal;
-        if (p != myRank) {
-          num_recvs(p) ++;
+        if (p != myRank && check(h_A.col_idx(k)) == 0
+            && h_A.values(k) != zero) { // cheat?
+          host_num_recvs(p) ++;
+          check(h_A.col_idx(k)) = 1;
         }
       }
     }
     int total_recvs = 0;
-    int num_neighbors = 0;
+    int num_neighbors_recvs = 0;
+    host_integer_view_t dsp_recvs("dsp_recvs", numRanks+1);
     for (int p=0; p<numRanks; p++) {
-      if (num_recvs(p) > 0) {
-        total_recvs += num_recvs(p);
-        num_neighbors ++;
+      if (host_num_recvs(p) > 0) {
+        total_recvs += host_num_recvs(p);
+        num_neighbors_recvs ++;
       }
-      dsp_recvs(p+1) = dsp_recvs(p) + num_recvs(p);
+      dsp_recvs(p+1) = dsp_recvs(p) + host_num_recvs(p);
     }
     host_integer_view_t map_recvs("map_recvs", numRanks);
-    ngb_recvs = integer_view_t("ngb_recvs", num_neighbors);
-    ptr_recvs = integer_view_t("ptr_recvs", num_neighbors+1);
+    ngb_recvs = integer_view_t("ngb_recvs", num_neighbors_recvs);
+    ptr_recvs = integer_view_t("ptr_recvs", num_neighbors_recvs+1);
     host_ngb_recvs = Kokkos::create_mirror_view(ngb_recvs);
     host_ptr_recvs = Kokkos::create_mirror_view(ptr_recvs);
 
     max_num_recvs = 0;
-    num_neighbors = 0;
+    num_neighbors_recvs = 0;
     for (int p=0; p<numRanks; p++) {
-      if (num_recvs(p) > 0) {
-        host_ptr_recvs(num_neighbors+1) = host_ptr_recvs(num_neighbors) + num_recvs(p);
-        host_ngb_recvs(num_neighbors) = p;
-        map_recvs(p) = num_neighbors;
-        num_neighbors ++;
+      if (host_num_recvs(p) > 0) {
+        host_ptr_recvs(num_neighbors_recvs+1) = host_ptr_recvs(num_neighbors_recvs) + host_num_recvs(p);
+        host_ngb_recvs(num_neighbors_recvs) = p;
+        map_recvs(p) = num_neighbors_recvs;
+        num_neighbors_recvs ++;
 
-        max_num_recvs = (num_recvs(p) > max_num_recvs ? num_recvs(p) : max_num_recvs);
+        max_num_recvs = (host_num_recvs(p) > max_num_recvs ? host_num_recvs(p) : max_num_recvs);
       }
     }
+    //#define OPTIMIZE
+    #if defined(OPTIMIZE)
+    // allocate for max_num_recvs, to avoid if in 
+    num_neighbors_recvs = 0;
+    for (int p = 0; p < numRanks; p++) {
+      if (host_num_recvs(p) > 0) {
+        num_neighbors_recvs ++;
+        host_ptr_recvs(num_neighbors_recvs) = num_neighbors_recvs*max_num_recvs;
+      }
+      dsp_recvs(p+1) = num_neighbors_recvs*max_num_recvs;
+    }
+    total_recvs = max_num_recvs * num_neighbors_recvs;
+    #endif
     buf_recvs = buffer_view_t ("buf_recvs", total_recvs);
     idx_recvs = integer_view_t("idx_recvs", total_recvs);
     host_idx_recvs = Kokkos::create_mirror_view(idx_recvs);
 
+    Kokkos::deep_copy(check, 0);
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
         int p = h_A.col_idx(k) / nlocal;
-        if (p != myRank) {
+        if (p != myRank && check(h_A.col_idx(k)) == 0
+            && h_A.values(k) != zero) {
           int owner = map_recvs(p);
           host_idx_recvs(host_ptr_recvs(owner)) = h_A.col_idx(k);
           host_ptr_recvs(owner) ++;
+
+          check(h_A.col_idx(k)) = 1;
         }
       }
     }
-    for (int p=num_neighbors; p > 0; p--) {
+    #if defined(OPTIMIZE)
+    for (int p = 0; p < num_neighbors_recvs; p++) {
+      // set the remaining to the last element to send (redandunt)
+      for (int k = host_ptr_recvs(p); k < (1+p)*max_num_recvs; k++) {
+        host_idx_recvs(k) = host_idx_recvs(host_ptr_recvs(p)-1);
+      }
+      host_ptr_recvs(p) = p*max_num_recvs;
+    }
+    #else
+    for (int p = num_neighbors_recvs; p > 0; p--) {
       host_ptr_recvs(p) = host_ptr_recvs(p-1);
     }
     host_ptr_recvs(0) = 0;
+    #endif
+/*if (myRank == 1) {
+  printf( " max = %d\n",max_num_recvs );
+  for (int p = 0; p < num_neighbors_recvs; p++) {
+    printf( " > ptr[%d] = %d (%d), num[%d]=%d\n",p,host_ptr_recvs(p),host_ptr_recvs(p+1)-host_ptr_recvs(p), host_ngb_recvs(p),host_num_recvs(host_ngb_recvs(p)));
+    for (int k = host_ptr_recvs(p); k < host_ptr_recvs(p)+host_num_recvs(host_ngb_recvs(p)); k++) {
+      printf( " + %d %d %d\n",p,k,host_idx_recvs(k) );
+    }
+    for (int k = host_ptr_recvs(p)+host_num_recvs(host_ngb_recvs(p)); k < host_ptr_recvs(p+1); k++) {
+      printf( " - %d %d %d\n",p,k,host_idx_recvs(k) );
+    }
+    printf("\n");
+  }
+}*/
+
+    Kokkos::deep_copy(num_recvs, host_num_recvs);
     Kokkos::deep_copy(ptr_recvs, host_ptr_recvs);
     Kokkos::deep_copy(idx_recvs, host_idx_recvs);
     Kokkos::deep_copy(ngb_recvs, host_ngb_recvs);
+    requests_recvs = (MPI_Request*)malloc(num_neighbors_recvs * sizeof(MPI_Request));
 
     // ----------------------------------------------------------
     // find which elements to send to which process
     host_integer_view_t num_sends("num_sends", numRanks);
     host_integer_view_t dsp_sends("dsp_sends", numRanks+1);
-    MPI_Alltoall(&(num_recvs(0)), 1, MPI_INT, &(num_sends(0)), 1, MPI_INT, MPI_COMM_WORLD);
+    MPI_Alltoall(&(host_num_recvs(0)), 1, MPI_INT, &(num_sends(0)), 1, MPI_INT, MPI_COMM_WORLD);
     int total_sends = 0;
-    num_neighbors = 0;
+    int num_neighbors_sends = 0;
     for (int p=0; p<numRanks; p++) {
       if (num_sends(p) > 0) {
         total_sends += num_sends(p);
-        num_neighbors ++;
+        num_neighbors_sends ++;
       }
       dsp_sends(p+1) = dsp_sends(p) + num_sends(p);
     }
-    ngb_sends = integer_view_t("ngb_sends", num_neighbors);
-    ptr_sends = integer_view_t("ptr_sends", num_neighbors+1);
+    ngb_sends = integer_view_t("ngb_sends", num_neighbors_sends);
+    ptr_sends = integer_view_t("ptr_sends", num_neighbors_sends+1);
     host_ngb_sends = Kokkos::create_mirror_view(ngb_sends);
     host_ptr_sends = Kokkos::create_mirror_view(ptr_sends);
 
-    num_neighbors = 0;
+    num_neighbors_sends = 0;
     max_num_sends = 0;
     for (int p=0; p<numRanks; p++) {
-      //printf( " > %d: num_sends(%d) = %d, num_recvs(%d) = %d\n",myRank,p,num_sends(p),p,num_recvs(p) );
+      //printf( " > %d: num_sends(%d) = %d, num_recvs(%d) = %d\n",myRank,p,num_sends(p),p,host_num_recvs(p) );
       if (num_sends(p) > 0) {
-        host_ptr_sends(num_neighbors+1) = host_ptr_sends(num_neighbors) + num_sends(p);
-        host_ngb_sends(num_neighbors) = p;
-        num_neighbors ++;
+        host_ptr_sends(num_neighbors_sends+1) = host_ptr_sends(num_neighbors_sends) + num_sends(p);
+        host_ngb_sends(num_neighbors_sends) = p;
+        num_neighbors_sends ++;
 
         max_num_sends = (num_sends(p) > max_num_sends ? num_sends(p) : max_num_sends);
       }
@@ -187,42 +237,95 @@ struct cgsolve_spmv
     }
     //printf( " %d: num_sends = %d, num_recvs = %d\n",myRank,ngb_sends.extent(0),ngb_recvs.extent(0) );
 
-    buf_sends = buffer_view_t ("buf_recvs", total_sends);
+    buf_sends = buffer_view_t ("buf_send", total_sends);
     idx_sends = integer_view_t("idx_sends", total_sends);
     host_idx_sends = Kokkos::create_mirror_view(idx_sends);
-    MPI_Alltoallv(&(host_idx_recvs(0)), &(num_recvs(0)), &(dsp_recvs(0)), MPI_INT,
+    MPI_Alltoallv(&(host_idx_recvs(0)), &(host_num_recvs(0)), &(dsp_recvs(0)), MPI_INT,
                   &(host_idx_sends(0)), &(num_sends(0)), &(dsp_sends(0)), MPI_INT,
                   MPI_COMM_WORLD);
-    /*if (myRank == 0) {
-      for (int p = 0; p <num_neighbors; p++) {
-        for (int k = host_ptr_sends(p); k < host_ptr_sends(p+1); k++) {
-          printf("%d %d\n",p,host_idx_sends(k) );
-        }
+    /*{
+      char filename[200];
+      FILE *fp;
+      sprintf(filename,"send%d_%d.dat",numRanks, myRank);
+      fp = fopen(filename, "w");
+      for (int p = 0; p <host_ptr_sends.extent(0)-1; p++) {
+        int q = host_ngb_sends(p);
+        fprintf(fp,"%d: %d to %d\n",p,host_ptr_sends(p+1)-host_ptr_sends(p),q);
       }
+      fprintf(fp,"\n");
+      for (int p = 0; p <host_ptr_sends.extent(0)-1; p++) {
+        int q = host_ngb_sends(p);
+        for (int k = host_ptr_sends(p); k < host_ptr_sends(p+1); k++) {
+          fprintf(fp," > send[%d,%d] = %d\n",p,q,host_idx_sends(k) );
+        }
+        fprintf(fp,"\n");
+      }
+      fclose(fp);
+
+      sprintf(filename,"recv%d_%d.dat",numRanks, myRank);
+      fp = fopen(filename, "w");
+      for (int p = 0; p <host_ptr_recvs.extent(0)-1; p++) {
+        int q = host_ngb_recvs(p);
+        fprintf(fp,"%d from %d\n",host_ptr_recvs(p+1)-host_ptr_recvs(p),q);
+      }
+      for (int p = 0; p <host_ptr_recvs.extent(0)-1; p++) {
+        int q = host_ngb_recvs(p);
+        for (int k = host_ptr_recvs(p); k < host_ptr_recvs(p+1); k++) {
+          fprintf(fp," > recv[%d,%d] = %d\n",p,q,host_idx_recvs(k) );
+        }
+        fprintf(fp,"\n");
+      }
+      fclose(fp);
     }*/
+    #if defined(CGSOLVE_SPMV_TIMER)
+    if (myRank == 0) {
+      for (int p = 0; p < numRanks; p ++) {
+        printf( " num_sends(%d) = %d, num_recvs(%d) = %d\n",p,num_sends(p),p,host_num_recvs(p) );
+      }
+    }
+    #endif
 
     Kokkos::deep_copy(ptr_sends, host_ptr_sends);
     Kokkos::deep_copy(idx_sends, host_idx_sends);
     Kokkos::deep_copy(ngb_sends, host_ngb_sends);
-    requests = (MPI_Request*)malloc(num_neighbors * sizeof(MPI_Request));
+    requests_sends = (MPI_Request*)malloc(num_neighbors_sends * sizeof(MPI_Request));
   }
 
   // -------------------------------------------------------------
   // P2P by MPI
   void exchange(XType x) {
-    // pack on device
+
+    // prepar recv on host/device
+    #if !defined(CGSOLVE_GPU_AWARE_MPI)
+    auto host_recvs = Kokkos::create_mirror_view(buf_recvs);
+    #endif
+    int num_neighbors_recvs = ngb_recvs.extent(0);
+    for (int q = 0; q < num_neighbors_recvs; q++) {
+      int p = host_ngb_recvs(q);
+      int start = host_ptr_recvs(q);
+      int count = host_num_recvs(p); //host_ptr_recvs(q+1)-start;
+
+      #if defined(CGSOLVE_GPU_AWARE_MPI)
+      double *buffer = buf_recvs.data();
+      MPI_Irecv(&buffer[start], count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
+      #else
+      MPI_Irecv(&(host_recvs(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
+      #endif
+    }
+
+    // pack to send on device
     #if defined(CGSOLVE_SPMV_TIMER)
+    Kokkos::Timer timer;
     if (time_spmv_on) {
-      Kokkos::Timer timer;
       Kokkos::fence();
       timer.reset();
     }
     #endif
-    int num_sends = ngb_sends.extent(0);
+    int num_neighbors_sends = ngb_sends.extent(0);
     Kokkos::parallel_for(team_policy_type(max_num_sends, Kokkos::AUTO),
       KOKKOS_LAMBDA(const member_type & team) {
         int k = team.league_rank();
-        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(team, 0, num_sends),
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(team, 0, num_neighbors_sends),
           [&](const int q) {
             int p = ngb_sends(q);
             int start = ptr_sends(q);
@@ -255,37 +358,21 @@ struct cgsolve_spmv
     // P2P with MPI
     Kokkos::fence();
     // send on host/device
-    for (int q=0; q<num_sends; q++) {
+    for (int q = 0; q < num_neighbors_sends; q++) {
       int p = host_ngb_sends(q);
       int start = host_ptr_sends(q);
       int count = host_ptr_sends(q+1)-start;
       //printf( " %d: MPI_Isend(count = %d, p = %d)\n",myRank,count,p );
       #if !defined(CGSOLVE_GPU_AWARE_MPI)
-      MPI_Isend(&(host_sends(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests[q]);
+      MPI_Isend(&(host_sends(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #else
       double *buffer = buf_sends.data();
-      MPI_Isend(&buffer[start], count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests[q]);
+      MPI_Isend(&buffer[start], count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #endif
     }
 
-    // recv on host/device
-    #if !defined(CGSOLVE_GPU_AWARE_MPI)
-    auto host_recvs = Kokkos::create_mirror_view(buf_recvs);
-    #endif
-    for (int q=0; q<ngb_recvs.extent(0); q++) {
-      int p = host_ngb_recvs(q);
-      int start = host_ptr_recvs(q);
-      int count = host_ptr_recvs(q+1)-start;
-
-      MPI_Status stat;
-      //printf( " %d: MPI_Irecv(count = %d, p = %d)\n",myRank,count,p );
-      #if !defined(CGSOLVE_GPU_AWARE_MPI)
-      MPI_Recv(&(host_recvs(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &stat);
-      #else
-      double *buffer = buf_recvs.data();
-      MPI_Recv(&buffer[start], count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &stat);
-      #endif
-    }
+    // wait on recv
+    MPI_Waitall(num_neighbors_recvs, requests_recvs, MPI_STATUSES_IGNORE);
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       time_comm_mpi = timer.seconds();
@@ -305,18 +392,22 @@ struct cgsolve_spmv
     #endif
 
     // unpack on device
-    int num_recvs = ngb_recvs.extent(0);
     Kokkos::parallel_for(team_policy_type(max_num_recvs, Kokkos::AUTO),
       KOKKOS_LAMBDA(const member_type & team) {
         int k = team.league_rank();
-        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(team, 0, num_recvs),
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(team, 0, num_neighbors_recvs),
           [&](const int q) {
             int p = ngb_recvs(q);
             int start = ptr_recvs(q);
-            int count = ptr_recvs(q+1)-start;
+            int count = num_recvs(p); //ptr_recvs(q+1)-start;
+            #if defined(OPTIMIZE)
+            int id = (k < count ? start+k : start+count-1);
+            x(idx_recvs(id)) = buf_recvs(id);
+            #else
             if (k < count) {
               x(idx_recvs(start+k)) = buf_recvs(start+k);
             }
+            #endif
           });
       });
     #if defined(CGSOLVE_SPMV_TIMER)
@@ -328,7 +419,7 @@ struct cgsolve_spmv
     #endif
 
     // wait for send
-    MPI_Waitall(num_sends, requests, MPI_STATUSES_IGNORE);
+    MPI_Waitall(num_neighbors_sends, requests_sends, MPI_STATUSES_IGNORE);
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       time_comm_mpi += timer.seconds();
@@ -424,11 +515,13 @@ private:
   HAType h_A;
 
   int myRank, numRanks;
-  MPI_Request *requests;
+  MPI_Request *requests_sends;
+  MPI_Request *requests_recvs;
 
   int max_num_recvs;
   buffer_view_t  buf_recvs;
   integer_view_t ngb_recvs; // store proc id of neighbors
+  integer_view_t num_recvs; // number of elements to send to each process
   integer_view_t ptr_recvs; // pointer to the begining of idx_recvs for each neighbor
   integer_view_t idx_recvs; // store col indices of elements to receive
 
@@ -440,6 +533,7 @@ private:
 
   // mirrored on host
   mirror_integer_view_t host_ngb_recvs; // store proc id of neighbors
+  mirror_integer_view_t host_num_recvs; // number of elements to send to each process
   mirror_integer_view_t host_ptr_recvs; // pointer to the begining of idx_recvs for each neighbor
   mirror_integer_view_t host_idx_recvs; // store col indices of elements to receive
 
@@ -766,15 +860,10 @@ int cg_solve(VType x, OP op, VType b,
       beta = zero;
       pAp = zero;
     } else {
-      #if 0
-      beta = new_rr / old_rr;
-      pAp = rAr + beta*beta*pAp;
-      //printf( " > pap = %e - %e * %e * %e = %e\n",new_rr, beta,beta,alpha, pAp);
-      #else
       beta = new_rr / old_rr;
       pAp = rAr - new_rr * (beta / alpha);
       //printf( " > pap = %e - %e * (%e / %e) = %e\n",rAr,new_rr,beta,alpha, rAr - new_rr * (beta / alpha) );
-      #endif
+
       alpha = new_rr / pAp;
       //printf( " %d:%d: > beta = %e / %e = %e\n",myRank,k,new_rr,old_rr,beta );
       //printf( " %d:%d: > alpha = %e / %e = %e\n",myRank,k,new_rr,pAp,alpha );
@@ -975,8 +1064,10 @@ int main(int argc, char *argv[]) {
     sprintf(filename,"A%d_%d.dat",numRanks, myRank);
     fp = fopen(filename, "w");
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
-      for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++)
-        fprintf(fp, "%d %d %.16e %d\n",i,h_A.col_idx(k), h_A.values(k), k );
+      for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
+        //fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
+        fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
+      }
     }
     fclose(fp);*/
 
