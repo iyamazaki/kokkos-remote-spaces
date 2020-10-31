@@ -47,6 +47,8 @@
 #include <generate_matrix.hpp>
 #include <mpi.h>
 
+#include "KokkosKernels_IOUtils.hpp"
+
 //#define CGSOLVE_SPMV_TIMER
 
 #define CGSOLVE_GPU_AWARE_MPI
@@ -903,6 +905,8 @@ int main(int argc, char *argv[]) {
   using  AType = CrsMatrix<memory_space>;
   using HAType = CrsMatrix<host_execution_space>;
 
+  using VTypeHost = Kokkos::View<double *, Kokkos::HostSpace>;
+
   Kokkos::initialize(argc, argv);
   {
     int N            = 100;
@@ -917,6 +921,10 @@ int main(int argc, char *argv[]) {
     for(int i = 0; i < argc; i++) {
       if((strcmp(argv[i],"-N")==0)) {
         N = atoi(argv[++i]);
+        continue;
+      }
+      if((strcmp(argv[i],"-f")==0)) {
+        matrixFilename = argv[++i];
         continue;
       }
       if((strcmp(argv[i],"-iter")==0)) {
@@ -951,19 +959,63 @@ int main(int argc, char *argv[]) {
       std::cout << std::endl;
     }
 
+    const double one = 1.0;
+    const double zero = 0.0;
+
     // generate matrix on host
-    int n = 0;
-    int nlocal = 0;
+    int64_t n = 0;
+    int64_t nlocal = 0;
+    int64_t start_row = 0;
+    int64_t end_row = 0;
+
     HAType h_A;
-    Kokkos::View<double *, Kokkos::HostSpace> h_b;
+    VTypeHost h_b;
     if (matrixFilename != "") {
+      double  *values;
+      int64_t *col_idx;
+      int64_t *row_ptr, nnz;
+      KokkosKernels::Impl::read_matrix<int64_t, int64_t, double>(
+        &n, &nnz, &row_ptr, &col_idx, &values, matrixFilename.c_str());
+
+      nlocal = (n + numRanks - 1) / numRanks;
+      start_row = myRank * nlocal;
+      end_row = (myRank + 1) * nlocal;
+      if (end_row > n)
+        end_row = n;
+
+      int64_t nnzlocal = row_ptr[end_row] - row_ptr[start_row];
+      Kokkos::View<int64_t *, Kokkos::HostSpace> rowPtr(
+        "Matrix::rowPtr", nlocal + 1);
+      Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+        "Matrix::colInd", nnzlocal);
+      Kokkos::View<double *, Kokkos::HostSpace> nzVal(
+        "MM_Matrix::values", nnzlocal);
+
+      nnzlocal = 0;
+      rowPtr(0) = 0;
+      for (int64_t i = start_row; i < end_row; i++) {
+        for (int64_t k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+          colInd(nnzlocal) =  col_idx[k];
+          nzVal(nnzlocal) =  values[k];
+          nnzlocal ++;
+        }
+        rowPtr(i-start_row+1) = nnzlocal;
+      }
+      h_A = CrsMatrix<Kokkos::HostSpace> (rowPtr, colInd, nzVal, nlocal);
+      h_b = VTypeHost("b_h", n);
+      Kokkos::deep_copy(h_b, one);
     } else {
       h_A = Impl::generate_miniFE_matrix(N);
       // generate rhs
       h_b = Impl::generate_miniFE_vector(N);
+
       // global/local dimension
       n = h_b.extent(0);
       nlocal = (n + numRanks - 1) / numRanks;
+      start_row = myRank * nlocal;
+      end_row = (myRank + 1) * nlocal;
+      if (end_row > n)
+        end_row = n;
 
       // convert the column indexes to "standard" global indexes
       for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
@@ -996,17 +1048,11 @@ int main(int argc, char *argv[]) {
     fp = fopen(filename, "w");
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
-        //fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
-        fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
+        fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
+        //fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
       }
     }
     fclose(fp);*/
-
-    // global
-    int64_t start_row = myRank * nlocal;
-    int64_t end_row = (myRank + 1) * nlocal;
-    if (end_row > n)
-      end_row = n;
 
     // local rhs on device
     Kokkos::pair<int64_t, int64_t> bounds(start_row, end_row);
@@ -1039,8 +1085,6 @@ int main(int argc, char *argv[]) {
     double time = timer.seconds();
 
     {
-      const double one = 1.0;
-      const double zero = 0.0;
       VType r("Y", x_sub.extent(0));
       axpby(p_sub, one, x_sub, zero, x_sub);
       op.apply(r, p);
