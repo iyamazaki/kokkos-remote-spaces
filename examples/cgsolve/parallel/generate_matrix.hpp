@@ -296,5 +296,77 @@ Kokkos::View<double *, Kokkos::HostSpace> generate_miniFE_vector(int64_t nx) {
   return X;
 }
 
+
+
+static CrsMatrix<Kokkos::HostSpace> generate_Laplace_matrix(int nx, int ny, int nz) {
+  // global dimension
+  int n   = (nz > 1 ? nx * ny * nz : nx * ny);
+  int nnz = (nz > 1 ? 7*n : 5*n);
+  Kokkos::View<int64_t *, Kokkos::HostSpace> rowPtr(
+      "generate_MiniFE_Matrix::rowPtr", n + 1);
+  Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+      "generate_MiniFE_Matrix::colInd", nnz);
+  Kokkos::View<double *, Kokkos::HostSpace> nzVals(
+      "generate_MiniFE_Matrix::values", nnz);
+
+  nnz = 0;
+  rowPtr(0) = 0;
+  for (int ii = 0; ii < n; ii++) {
+    double v = -1.0;
+    int i, j, k, jj;
+    k = ii / (nx*ny);
+    i = (ii - k*nx*ny) / nx;
+    j = ii - k*nx*ny - i*nx;
+
+    if (k > 0) {
+      jj = ii - nx * ny;
+      colInd(nnz) = jj;
+      nzVals(nnz) = v;
+      nnz++;
+    }
+    if (k < nz-1) {
+      jj = ii + nx * ny;
+      colInd(nnz) = jj;
+      nzVals(nnz) = v;
+      nnz++;
+    }
+
+    if (i > 0) {
+      jj = ii - nx;
+      colInd(nnz) = jj;
+      nzVals(nnz) = v;
+      nnz++;
+    }
+    if (i < ny-1) {
+      jj = ii + nx;
+      colInd(nnz) = jj;
+      nzVals(nnz) = v;
+      nnz++;
+    }
+
+    if (j > 0) {
+      jj = ii - 1;
+      colInd(nnz) = jj;
+      nzVals(nnz) = v;
+      nnz++;
+    }
+    if (j < nx-1) {
+      jj = ii + 1;
+      colInd(nnz) = jj;
+      nzVals(nnz) = v;
+      nnz++;
+    }
+
+    v = nz > 1 ? 6.0 : 4.0;
+    colInd(nnz) = ii;
+    nzVals(nnz) = v;
+    nnz++;
+
+    rowPtr(ii+1) = nnz;
+  }
+  CrsMatrix<Kokkos::HostSpace> matrix(rowPtr, colInd, nzVals, n);
+  return matrix;
+}
+
 } // namespace Impl
 #endif
