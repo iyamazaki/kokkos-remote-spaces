@@ -945,6 +945,7 @@ int main(int argc, char *argv[]) {
     int idot_option  = 0;
     std::string matrixFilename {""};
 
+    bool metis       = false;
     bool verbose     = false;
     bool time_idot   = false;
     bool time_spmv   = false;
@@ -986,6 +987,12 @@ int main(int argc, char *argv[]) {
         time_idot = true;
         continue;
       }
+      #if defined(CGSOLVE_ENABLE_METIS)
+      if((strcmp(argv[i],"-metis")==0)) {
+        metis = true;
+        continue;
+      }
+      #endif
     }
 
     using default_execution_space = Kokkos::DefaultExecutionSpace;
@@ -1015,8 +1022,8 @@ int main(int argc, char *argv[]) {
       double  *values;
       int64_t *col_idx;
       int64_t *row_ptr;
+      int64_t nnz = 0;
       if (matrixFilename != "") {
-        int64_t nnz = 0;
         KokkosKernels::Impl::read_matrix<int64_t, int64_t, double>(
           &n, &nnz, &row_ptr, &col_idx, &values, matrixFilename.c_str());
       } else if (nx > 0) {
@@ -1025,10 +1032,11 @@ int main(int argc, char *argv[]) {
         col_idx = h_G.col_idx.data();
         row_ptr = h_G.row_ptr.data();
         n = nx * nx *nx;
+        nnz = row_ptr[n];
       }
 
       #if defined(CGSOLVE_ENABLE_METIS)
-      if (1) {
+      if (metis) {
         int *parts = new int[n];
         if (myRank == 0) {
           idx_t n_metis = n;
@@ -1132,6 +1140,9 @@ int main(int argc, char *argv[]) {
       } else
       #endif
       {
+        if (myRank == 0) {
+          std::cout << "  + using regular 1D partition of matrix : (n=" << n << ", nnz=" << nnz << ") " << std::endl;
+        }
         nlocal = (n + numRanks - 1) / numRanks;
         start_row = myRank * nlocal;
         end_row = (myRank + 1) * nlocal;
