@@ -51,9 +51,9 @@
 
 #define CGSOLVE_SPMV_TIMER
 
-#define CGSOLVE_GPU_AWARE_MPI
-#define CGSOLVE_ENABLE_CUBLAS
-//#define CGSOLVE_ENABLE_METIS
+//#define CGSOLVE_GPU_AWARE_MPI
+//#define CGSOLVE_ENABLE_CUBLAS
+#define CGSOLVE_ENABLE_METIS
 
 #if defined(CGSOLVE_ENABLE_CUBLAS)
 #include <cublas_v2.h>
@@ -98,12 +98,13 @@ struct cgsolve_spmv
 
   // -------------------------------------------------------------
   // setup P2P
-  void setup() {
+  void setup(int nlocal_, int *part_map_) {
     MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
     MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
     // global/local dimension
-    nlocal = (n + numRanks - 1) / numRanks;
+    nlocal = nlocal_;
+    part_map = part_map_;
 
     // ----------------------------------------------------------
     // find which elements to receive from which process
@@ -115,11 +116,17 @@ struct cgsolve_spmv
     Kokkos::deep_copy(check, 0);
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
-        int p = h_A.col_idx(k) / nlocal;
-        if (p != myRank && check(h_A.col_idx(k)) == 0
+        int p = -1;
+        int col_id = h_A.col_idx(k);
+        if (nlocal > 0) {
+          p = col_id / nlocal;
+        } else {
+          p = part_map[col_id];
+        }
+        if (p != myRank && check(col_id) == 0
             && h_A.values(k) != zero) { // cheat?
           host_num_recvs(p) ++;
-          check(h_A.col_idx(k)) = 1;
+          check(col_id) = 1;
         }
       }
     }
@@ -158,11 +165,17 @@ struct cgsolve_spmv
     Kokkos::deep_copy(check, 0);
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
-        int p = h_A.col_idx(k) / nlocal;
-        if (p != myRank && check(h_A.col_idx(k)) == 0
+        int p = -1;
+        int col_id = h_A.col_idx(k);
+        if (nlocal > 0) {
+          p = col_id / nlocal;
+        } else {
+          p = part_map[col_id];
+        }
+        if (p != myRank && check(col_id) == 0
             && h_A.values(k) != zero) {
           int owner = map_recvs(p);
-          host_idx_recvs(host_ptr_recvs(owner)) = h_A.col_idx(k);
+          host_idx_recvs(host_ptr_recvs(owner)) = col_id;
           host_ptr_recvs(owner) ++;
 
           check(h_A.col_idx(k)) = 1;
@@ -443,9 +456,10 @@ struct cgsolve_spmv
   double time_spmv;
 
 private:
-  int n, nlocal;
   AType A;
   HAType h_A;
+  int n, nlocal;
+  int *part_map;
 
   int myRank, numRanks;
   MPI_Request *requests_sends;
@@ -988,6 +1002,7 @@ int main(int argc, char *argv[]) {
     const double zero = 0.0;
 
     // generate matrix on host
+    int *part_map = nullptr;
     int64_t n = 0;
     int64_t nlocal = 0;
     int64_t start_row = 0;
@@ -1014,47 +1029,106 @@ int main(int argc, char *argv[]) {
 
       #if defined(CGSOLVE_ENABLE_METIS)
       if (1) {
-        idx_t n_metis = n;
-        idx_t nnz = row_ptr[n];
+        int *parts = new int[n];
+        if (myRank == 0) {
+          idx_t n_metis = n;
+          idx_t nnz = row_ptr[n];
 
-        // remove diagonal elements (and casting to METIS idx_t)
-        idx_t *metis_rowptr = new idx_t[n+1];
-        idx_t *metis_colind = new idx_t[nnz];
+          // remove diagonal elements (and casting to METIS idx_t)
+          idx_t *metis_rowptr = new idx_t[n+1];
+          idx_t *metis_colind = new idx_t[nnz];
 
-        nnz = 0;
-        metis_rowptr[0] = 0;
-        for (int i = 0; i < n; i++) {
-          for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
-            if (col_idx[k] != i) {
-              metis_colind[nnz] = col_idx[k];
-              nnz ++;
+          nnz = 0;
+          metis_rowptr[0] = 0;
+          for (int i = 0; i < n; i++) {
+            for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+              if (col_idx[k] != i) {
+                metis_colind[nnz] = col_idx[k];
+                nnz ++;
+              }
             }
+            metis_rowptr[i+1] = nnz;
           }
-          metis_rowptr[i+1] = nnz;
-        }
 
-        // call METIS
-        idx_t *metis_perm = new idx_t[n];
-        idx_t *metis_part = new idx_t[n];
-        std::cout << "  + calling METIS_NodeND: (n=" << n << ", nnz=" << nnz << ") " << std::endl;
-        //if (METIS_OK != METIS_NodeND(&n_metis, metis_rowptr, metis_colind, NULL, NULL, metis_perm, metis_iperm)) {
-        //  std::cout << std::endl << "METIS_NodeND failed" << std::endl << std::endl;
-        //}
-        if (METIS_OK != METIS_PartGraphKway(&n_metis, &ncon, metis_rowptr, metis_colind,
-                                            NULL, NULL, NULL, &nparts, NULL, NULL, NULL, NULL, 
-                                            metis_part)) {
-          std::cout << std::endl << "METIS_NodeND failed" << std::endl << std::endl;
-        }
+          // call METIS
+          idx_t ncon = 1;
+          idx_t nparts = numRanks;
+          idx_t objval = 0;
+          idx_t *metis_perm = new idx_t[n];
+          idx_t *metis_part = new idx_t[n];
+          std::cout << "  + calling METIS_NodeND: (n=" << n << ", nnz=" << nnz << ") " << std::endl;
+          //if (METIS_OK != METIS_NodeND(&n_metis, metis_rowptr, metis_colind, NULL, NULL, metis_perm, metis_iperm)) {
+          //  std::cout << std::endl << "METIS_NodeND failed" << std::endl << std::endl;
+          //}
+          if (METIS_OK != METIS_PartGraphKway(&n_metis, &ncon, metis_rowptr, metis_colind,
+                                              NULL, NULL, NULL, &nparts, NULL, NULL, NULL,
+                                              &objval, metis_part)) {
+            std::cout << std::endl << "METIS_NodeND failed" << std::endl << std::endl;
+          }
 
+          for (idx_t i = 0; i < n; i++) {
+            parts[i] = metis_part[i];
+          }
+
+          delete [] metis_part;
+          delete [] metis_rowptr;
+          delete [] metis_colind;
+        }
+        MPI_Bcast(parts, n, MPI_INT, 0, MPI_COMM_WORLD);
         int *perm = new int[n];
-        for (idx_t i = 0; i < n; i++) {
-          perm[i] = metis_iperm[i];
+        int *iperm = new int[n];
+        int *part_ptr = new int[numRanks + 1];
+        for (int p = 0; p <= numRanks; p++) {
+          part_ptr[p] = 0;
         }
+        for (int p = 0; p < n; p++) {
+          part_ptr[1+parts[p]] ++;
+        }
+        part_map = new int[n];
+        for (int p = 0; p < numRanks; p++) {
+          part_ptr[p+1] += part_ptr[p];
+          for (int i = part_ptr[p]; i < part_ptr[p+1]; i++) {
+            part_map[i] = p;
+          }
+        }
+        int64_t nnzlocal = 0;
+        for (int i = 0; i < n; i++) {
+          int p = parts[i];
+          perm[part_ptr[p]] = i;
+          iperm[i] = part_ptr[p];
 
-        delete [] metis_perm;
-        delete [] metis_iperm;
-        delete [] metis_rowptr;
-        delete [] metis_colind;
+          nnzlocal += (row_ptr[i+1] - row_ptr[i]);
+          part_ptr[p] ++;
+        }
+        for (int p = numRanks; p > 0; p--) {
+          part_ptr[p] = part_ptr[p-1];
+        }
+        part_ptr[0] = 0;
+        //if (myRank == 0) {
+        //  for (int i = 0; i < n; i++) printf( " perm[%d]=%d iperm[%d]=%d, map[%d]=%d\n",i,perm[i],i,iperm[i],i,part_map[i]);
+        //}
+
+        start_row = part_ptr[myRank];
+        end_row = part_ptr[myRank+1];
+        Kokkos::View<int64_t *, Kokkos::HostSpace> rowPtr(
+          "Matrix::rowPtr", (end_row - start_row)+1);
+        Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+          "Matrix::colInd", nnzlocal);
+        Kokkos::View<double *, Kokkos::HostSpace> nzVal(
+          "MM_Matrix::values", nnzlocal);
+
+        nnzlocal = 0;
+        rowPtr(0) = 0;
+        for (int64_t id = start_row; id < end_row; id++) {
+          int64_t i = perm[id];
+          for (int64_t k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+            colInd(nnzlocal) = iperm[col_idx[k]];
+            nzVal(nnzlocal) =  values[k];
+            nnzlocal ++;
+          }
+          rowPtr(id-start_row+1) = nnzlocal;
+        }
+        h_A = HAType (rowPtr, colInd, nzVal, end_row - start_row);
       } else
       #endif
       {
@@ -1082,7 +1156,7 @@ int main(int argc, char *argv[]) {
           }
           rowPtr(i-start_row+1) = nnzlocal;
         }
-        h_A = HAType (rowPtr, colInd, nzVal, nlocal);
+        h_A = HAType (rowPtr, colInd, nzVal, end_row - start_row);
       }
       h_b = VTypeHost("b_h", n);
       Kokkos::deep_copy(h_b, one);
@@ -1149,7 +1223,7 @@ int main(int argc, char *argv[]) {
 
     // setup SpMV
     cgsolve_spmv<VType, HAType, AType, VType> op (n, h_A, A, time_spmv);
-    op.setup();
+    op.setup(nlocal, part_map);
 
     // local sol on device
     VType x_sub("x", b_sub.extent(0));
@@ -1165,7 +1239,7 @@ int main(int argc, char *argv[]) {
       } else {
         std::cout << " calling cg_solve ( N = " << N;
       }
-      std::cout << ", nloc = " << nloc
+      std::cout << ", n = " << n << ", nloc = " << nloc
                 << ", nnz/nloc = " << double(nnz)/double(nloc)
                 << ", idot = " << idot_option << " )" << std::endl;
     }
@@ -1202,8 +1276,7 @@ int main(int argc, char *argv[]) {
         if (myRank == 0) {
           printf( "\n ====================================" );
           printf( "\n rnorm = %e / %e = %e\n",rnorm,bnorm,rnorm/bnorm );
-          printf( " N = %i, n = %i, num_iters = %i, time = %.2lf\n\n", 
-                    N, n, num_iters, time);
+          printf( " num_iters = %i, time = %.2lf\n\n", num_iters, time);
         }
       } // end of check
     } // end of loop
