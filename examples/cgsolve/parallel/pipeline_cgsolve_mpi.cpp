@@ -616,6 +616,18 @@ void axpby(ZType z, double alpha, XType x, double beta, YType y) {
       KOKKOS_LAMBDA(const int &i) { z(i) = alpha * x(i) + beta * y(i); });
 }
 
+template <class ZType, class YType, class XType>
+void axpby(ZType z1, XType x1, double beta1, YType y1,
+           ZType z2, XType x2, double beta2, YType y2) {
+  int n = z1.extent(0);
+  Kokkos::parallel_for(
+      "AXPBY", n,
+      KOKKOS_LAMBDA(const int &i) {
+        z1(i) = x1(i) + beta1 * y1(i);
+        z2(i) = x2(i) + beta2 * y2(i);
+      });
+}
+
 
 
 // =============================================================
@@ -624,7 +636,7 @@ template <class VType, class OP>
 int cg_solve(VType x, OP op, VType b,
              VType Ar, VType Ar_global,
              int max_iter, double tolerance, int idot_option,
-             bool verbose, bool time_spmv_on, bool time_idot_on) {
+             bool verbose, bool time_spmv_on, bool time_idot_on, bool time_axpy_on) {
 
   MPI_Request request;
   MPI_Status status;
@@ -654,6 +666,9 @@ int cg_solve(VType x, OP op, VType b,
   double time_idot = 0.0;
   double time_idot_comm = 0.0;
   double time_idot_wait = 0.0;
+
+  Kokkos::Timer timer_axpy;
+  double time_axpy = 0.0;
 
 
   double normr = 0.0;
@@ -924,20 +939,49 @@ int cg_solve(VType x, OP op, VType b,
     }
     old_rr = new_rr;
 
-    // p = r + beta*p
-    axpby( p, one,  r, beta,  p);
+    if (time_axpy_on) {
+      timer_axpy.reset();
+    }
+    //  p =  r + beta *  p
     // Ap = Ar + beta * Ap
-    axpby(Ap, one, Ar, beta, Ap);
+    #if 0
+     axpby( p, one,  r, beta,  p);
+     axpby(Ap, one, Ar, beta, Ap);
+    #else
+     axpby( p, r, beta,  p,
+           Ap, Ar, beta, Ap);
+    #endif
 
     // x = x + alpha*p
-    axpby(x, one, x,  alpha,  p);
     // r = r - alpha*Ap
-    axpby(r, one, r, -alpha, Ap);
+    #if 1
+     #if defined(CGSOLVE_ENABLE_CUBLAS)
+     double malpha = -alpha;
+     cublasDaxpy(cublasHandle, nloc, &( alpha),  p.data(), 1, x.data(), 1);
+     cublasDaxpy(cublasHandle, nloc, &(malpha), Ap.data(), 1, r.data(), 1);
+     #else
+     axpby(x, one, x,  alpha,  p);
+     axpby(r, one, r, -alpha, Ap);
+     #endif
+    #else
+     axpby(x, x,  alpha,  p,
+           r, r, -alpha, Ap);
+    #endif
 
     // AAp = AAr + beta*AAp (since p = r + beta*p)
-    axpby(AAp, one, AAr, beta, AAp);
     // Ar = Ar - alpha*AAp (since Ar = A*(r - alpha*Ap))
+    #if 0
+    axpby(AAp, one, AAr, beta, AAp);
     axpby(Ar, one, Ar, -alpha, AAp);
+    #else
+    axpby(AAp, AAr,   beta, AAp,
+           Ar,  Ar, -alpha, AAp);
+    #endif
+    if (time_axpy_on) {
+      Kokkos::fence();
+      time_axpy += timer_axpy.seconds();
+    }
+
     //printf( " %d: p Ap, x r, Ar AAp\n",k );
     //Kokkos::fence();
     //for (int i=0; i<b.extent(0); i++) printf(" %e %e, %e %e, %e %e\n",p(i),Ap(i), x(i),r(i), Ar(i),AAp(i));
@@ -952,7 +996,7 @@ int cg_solve(VType x, OP op, VType b,
     std::cout << " > CG Main loop : iter = " << num_iters << " time = " << time_cg << std::endl;
   }
 
-  if (time_spmv_on || time_idot_on) {
+  if (time_spmv_on || time_idot_on || time_axpy_on) {
     if (myRank == 0) {
       printf( "\n  -------------------------------------------\n\n" );
     }
@@ -1010,14 +1054,17 @@ int cg_solve(VType x, OP op, VType b,
       MPI_Allreduce(&time_idot_wait, &min_dot_wait, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
       MPI_Allreduce(&time_idot_wait, &max_dot_wait, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
       if (myRank == 0) {
-        printf( "   time(iDot)          = %.2e + %.2e + %.2e = %.2e seconds\n", time_idot,time_idot_comm,time_idot_wait,
+        printf( "   time(iDot)            = %.2e + %.2e + %.2e = %.2e seconds\n", time_idot,time_idot_comm,time_idot_wait,
                                                                                 time_idot+time_idot_comm+time_idot_wait );
-        printf( "    + time(iDot)::comp  =  %.2e ~ %.2e seconds\n",min_dot_comp,max_dot_comp );
-        printf( "    + time(iDot)::comm  =  %.2e ~ %.2e seconds\n",min_dot_comm,max_dot_comm );
-        printf( "    + time(iDot)::wait  =  %.2e ~ %.2e seconds\n",min_dot_wait,max_dot_wait );
+        printf( "    + time(iDot)::comp    =  %.2e ~ %.2e seconds\n",min_dot_comp,max_dot_comp );
+        printf( "    + time(iDot)::comm    =  %.2e ~ %.2e seconds\n",min_dot_comm,max_dot_comm );
+        printf( "    + time(iDot)::wait    =  %.2e ~ %.2e seconds\n",min_dot_wait,max_dot_wait );
       }
     }
     if (myRank == 0) {
+      if (time_axpy_on) {
+        printf( "   time(axpy)              = %.2e seconds\n", time_axpy );
+      }
       printf( "\n  -------------------------------------------\n" );
     }
   }
@@ -1056,6 +1103,7 @@ int main(int argc, char *argv[]) {
     bool verbose     = false;
     bool time_idot   = false;
     bool time_spmv   = false;
+    bool time_axpy   = false;
     for(int i = 0; i < argc; i++) {
       if((strcmp(argv[i],"-loop")==0)) {
         loop = atoi(argv[++i]);
@@ -1096,6 +1144,10 @@ int main(int argc, char *argv[]) {
       }
       if((strcmp(argv[i],"-time-idot")==0)) {
         time_idot = true;
+        continue;
+      }
+      if((strcmp(argv[i],"-time-axpy")==0)) {
+        time_axpy = true;
         continue;
       }
       if((strcmp(argv[i],"-sort")==0)) {
@@ -1402,7 +1454,7 @@ int main(int argc, char *argv[]) {
       int num_iters = cg_solve(x_sub, op, b_sub,
                                p_sub, p,
                                max_iter, tolerance, idot_option,
-                               verbose, time_spmv, time_idot);
+                               verbose, time_spmv, time_idot, time_axpy);
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
       double time = timer.seconds();
