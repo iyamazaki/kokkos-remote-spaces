@@ -64,7 +64,7 @@ void spmv(YType y, AType A, XType x) {
 
   int vector_length = 8;
 
-  int64_t nrows = y.extent(0);
+  int nrows = y.extent(0);
 
   auto policy =
       require(Kokkos::TeamPolicy<>((nrows + rows_per_team - 1) / rows_per_team,
@@ -73,24 +73,24 @@ void spmv(YType y, AType A, XType x) {
   Kokkos::parallel_for(
       "spmv", policy,
       KOKKOS_LAMBDA(const Kokkos::TeamPolicy<>::member_type &team) {
-        const int64_t first_row = team.league_rank() * rows_per_team;
-        const int64_t last_row = first_row + rows_per_team < nrows
+        const int first_row = team.league_rank() * rows_per_team;
+        const int last_row = first_row + rows_per_team < nrows
                                      ? first_row + rows_per_team
                                      : nrows;
 
         Kokkos::parallel_for(
             Kokkos::TeamThreadRange(team, first_row, last_row),
-            [&](const int64_t row) {
-              const int64_t row_start = A.row_ptr(row);
-              const int64_t row_length = A.row_ptr(row + 1) - row_start;
+            [&](const int row) {
+              const int row_start = A.row_ptr(row);
+              const int row_length = A.row_ptr(row + 1) - row_start;
 
               double y_row = 0.0;
               Kokkos::parallel_reduce(
                   Kokkos::ThreadVectorRange(team, row_length),
-                  [=](const int64_t i, double &sum) {
-                    int64_t idx = A.col_idx(i + row_start);
-                    int64_t pid = idx / MASK;
-                    int64_t offset = idx % MASK;
+                  [=](const int i, double &sum) {
+                    int idx = A.col_idx(i + row_start);
+                    int pid = idx / MASK;
+                    int offset = idx % MASK;
 //printf( " (row=%d, col=%d): %e * %e (pid=%d, offset=%d)\n",row,idx,A.values(i + row_start), x(pid, offset),pid,offset );
                     sum += A.values(i + row_start) * x(pid, offset);
                   },
@@ -107,14 +107,14 @@ template <class YType, class XType> double dot(YType y, XType x) {
   double result = 0.0;
   Kokkos::parallel_reduce(
       "DOT", y.extent(0),
-      KOKKOS_LAMBDA(const int64_t &i, double &lsum) { lsum += y(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += y(i) * x(i); },
       result);
   return result;
 }
 
 template <class ZType, class YType, class XType>
 void axpby(ZType z, double alpha, XType x, double beta, YType y) {
-  int64_t n = z.extent(0);
+  int n = z.extent(0);
   Kokkos::parallel_for(
       "AXPBY", n,
       KOKKOS_LAMBDA(const int &i) { z(i) = alpha * x(i) + beta * y(i); });
@@ -150,7 +150,7 @@ int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
   double rAr = 0.0;
   double pAp = 0.0;
 
-  int64_t print_freq = max_iter / 10;
+  int print_freq = max_iter / 10;
   print_freq = 1;
   if (print_freq > 50)
     print_freq = 50;
@@ -191,7 +191,7 @@ int cg_solve(VType x, AType A, VType b, PType Ar_global, int max_iter,
   spmv(AAr, A, Ar_global);         // AAr = A*Ar
   axpby(Ar, one, AAr, zero, AAr);  // Ar = AAr
 
-  for (int64_t k = 1; k <= max_iter && normr > tolerance; ++k) {
+  for (int k = 1; k <= max_iter && normr > tolerance; ++k) {
     // beta = r'*r
     new_rr = dot(r, r);
     MPI_Allreduce(MPI_IN_PLACE, &new_rr, 1, MPI_DOUBLE, MPI_SUM,
@@ -286,8 +286,8 @@ int main(int argc, char *argv[]) {
     Kokkos::View<double *, Kokkos::HostSpace> h_b =
         Impl::generate_miniFE_vector(N);
 
-    Kokkos::View<int64_t *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
-    Kokkos::View<int64_t *> col_idx("col_idx", h_A.col_idx.extent(0));
+    Kokkos::View<int *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
+    Kokkos::View<int *> col_idx("col_idx", h_A.col_idx.extent(0));
     Kokkos::View<double *> values("values", h_A.values.extent(0));
     CrsMatrix<Kokkos::DefaultExecutionSpace::memory_space> A(
         row_ptr, col_idx, values, h_A.num_cols());
@@ -302,13 +302,13 @@ int main(int argc, char *argv[]) {
     RemoteView_t p = Kokkos::Experimental::allocate_symmetric_remote_view<RemoteView_t>(
         "MyView", numRanks, (h_b.extent(0) + numRanks - 1) / numRanks);
 
-    int64_t start_row = myRank * p.extent(1);
-    int64_t end_row = (myRank + 1) * p.extent(1);
+    int start_row = myRank * p.extent(1);
+    int end_row = (myRank + 1) * p.extent(1);
     if (end_row > h_b.extent(0))
       end_row = h_b.extent(0);
 
     // CG
-    Kokkos::pair<int64_t, int64_t> bounds(start_row, end_row);
+    Kokkos::pair<int, int> bounds(start_row, end_row);
     Kokkos::View<double *> b_sub = Kokkos::subview(b, bounds);
     Kokkos::View<double *> x_sub("x", b_sub.extent(0));
 
@@ -337,8 +337,8 @@ int main(int argc, char *argv[]) {
     }
 
     // Compute Bytes and Flops
-    double spmv_bytes  = A.num_rows() * sizeof(int64_t) +   // A.row_ptr
-                         A.nnz()      * sizeof(int64_t) +   // A.col_idx
+    double spmv_bytes  = A.num_rows() * sizeof(int) +   // A.row_ptr
+                         A.nnz()      * sizeof(int) +   // A.col_idx
                          A.nnz()      * sizeof(double)  +   // A.values
                          A.nnz()      * sizeof(double)  +   // input vector
                          A.num_rows() * sizeof(double);     // output vector

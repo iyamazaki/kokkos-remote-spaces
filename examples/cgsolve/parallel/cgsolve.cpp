@@ -64,7 +64,7 @@ void spmv(YType y, AType A, XType x) {
 
   int vector_length = 8;
 
-  int64_t nrows = y.extent(0);
+  int nrows = y.extent(0);
 
   auto policy =
       require(Kokkos::TeamPolicy<>((nrows + rows_per_team - 1) / rows_per_team,
@@ -73,24 +73,24 @@ void spmv(YType y, AType A, XType x) {
   Kokkos::parallel_for(
       "spmv", policy,
       KOKKOS_LAMBDA(const Kokkos::TeamPolicy<>::member_type &team) {
-        const int64_t first_row = team.league_rank() * rows_per_team;
-        const int64_t last_row = first_row + rows_per_team < nrows
+        const int first_row = team.league_rank() * rows_per_team;
+        const int last_row = first_row + rows_per_team < nrows
                                      ? first_row + rows_per_team
                                      : nrows;
 
         Kokkos::parallel_for(
             Kokkos::TeamThreadRange(team, first_row, last_row),
-            [&](const int64_t row) {
-              const int64_t row_start = A.row_ptr(row);
-              const int64_t row_length = A.row_ptr(row + 1) - row_start;
+            [&](const int row) {
+              const int row_start = A.row_ptr(row);
+              const int row_length = A.row_ptr(row + 1) - row_start;
 
               double y_row = 0.0;
               Kokkos::parallel_reduce(
                   Kokkos::ThreadVectorRange(team, row_length),
-                  [=](const int64_t i, double &sum) {
-                    int64_t idx = A.col_idx(i + row_start);
-                    int64_t pid = idx / MASK;
-                    int64_t offset = idx % MASK;
+                  [=](const int i, double &sum) {
+                    int idx = A.col_idx(i + row_start);
+                    int pid = idx / MASK;
+                    int offset = idx % MASK;
                     sum += A.values(i + row_start) * x(pid, offset);
                   },
                   y_row);
@@ -105,14 +105,14 @@ template <class YType, class XType> double dot(YType y, XType x) {
   double result = 0.0;
   Kokkos::parallel_reduce(
       "DOT", y.extent(0),
-      KOKKOS_LAMBDA(const int64_t &i, double &lsum) { lsum += y(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += y(i) * x(i); },
       result);
   return result;
 }
 
 template <class ZType, class YType, class XType>
 void axpby(ZType z, double alpha, XType x, double beta, YType y) {
-  int64_t n = z.extent(0);
+  int n = z.extent(0);
   Kokkos::parallel_for(
       "AXPBY", n,
       KOKKOS_LAMBDA(const int &i) { z(i) = alpha * x(i) + beta * y(i); });
@@ -141,11 +141,12 @@ int cg_solve(VType y, AType A, VType b, PType p_global, int max_iter,
   double rtrans = 0;
   double oldrtrans = 0;
 
-  int64_t print_freq = max_iter / 10;
+  int print_freq = max_iter / 10;
   if (print_freq > 50)
     print_freq = 50;
   if (print_freq < 1)
     print_freq = 1;
+  print_freq = 1;
   VType x("x", b.extent(0));
   VType r("r", x.extent(0));
   VType p(p_global.data(), x.extent(0)); // Globally accessible data
@@ -162,7 +163,7 @@ int cg_solve(VType y, AType A, VType b, PType p_global, int max_iter,
   MPI_Allreduce(MPI_IN_PLACE, &rtrans, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   normr = std::sqrt(rtrans);
 
-  if (false) {
+  if (true) {
     if (myproc == 0) {
       std::cout << "Initial Residual = " << normr << std::endl;
     }
@@ -170,7 +171,8 @@ int cg_solve(VType y, AType A, VType b, PType p_global, int max_iter,
 
   double brkdown_tol = std::numeric_limits<double>::epsilon();
 
-  for (int64_t k = 1; k <= max_iter && normr > tolerance; ++k) {
+  for (int k = 1; k <= max_iter && normr > tolerance; ++k) {
+    double beta = 0.0;
     if (k == 1) {
       axpby(p, one, r, zero, r);
     } else {
@@ -178,18 +180,11 @@ int cg_solve(VType y, AType A, VType b, PType p_global, int max_iter,
       rtrans = dot(r, r);
       MPI_Allreduce(MPI_IN_PLACE, &rtrans, 1, MPI_DOUBLE, MPI_SUM,
                     MPI_COMM_WORLD);
-      double beta = rtrans / oldrtrans;
+      beta = rtrans / oldrtrans;
       axpby(p, one, r, beta, p);
     }
 
     normr = std::sqrt(rtrans);
-
-    if (false) {
-      if (myproc == 0 && (k % print_freq == 0 || k == max_iter)) {
-        std::cout << "Iteration = " << k << "   Residual = " << normr
-                  << std::endl;
-      }
-    }
 
     double alpha = 0;
     double p_ap_dot = 0;
@@ -208,6 +203,13 @@ int cg_solve(VType y, AType A, VType b, PType p_global, int max_iter,
         brkdown_tol = 0.1 * p_ap_dot;
     }
     alpha = rtrans / p_ap_dot;
+    if (true) {
+      if (myproc == 0 && (k % print_freq == 0 || k == max_iter)) {
+        std::cout << "Iteration = " << k << "   Residual = " << normr
+                  << " beta = " << beta << ", alpha = " << alpha
+                  << std::endl;
+      }
+    }
 
     axpby(x, one, x, alpha, p);
     axpby(r, one, r, -alpha, Ap);
@@ -243,8 +245,8 @@ int main(int argc, char *argv[]) {
     Kokkos::View<double *, Kokkos::HostSpace> h_x =
         Impl::generate_miniFE_vector(N);
 
-    Kokkos::View<int64_t *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
-    Kokkos::View<int64_t *> col_idx("col_idx", h_A.col_idx.extent(0));
+    Kokkos::View<int *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
+    Kokkos::View<int *> col_idx("col_idx", h_A.col_idx.extent(0));
     Kokkos::View<double *> values("values", h_A.values.extent(0));
     CrsMatrix<Kokkos::DefaultExecutionSpace::memory_space> A(
         row_ptr, col_idx, values, h_A.num_cols());
@@ -260,13 +262,13 @@ int main(int argc, char *argv[]) {
     RemoteView_t p = Kokkos::Experimental::allocate_symmetric_remote_view<RemoteView_t>(
         "MyView", numRanks, (h_x.extent(0) + numRanks - 1) / numRanks);
 
-    int64_t start_row = myRank * p.extent(1);
-    int64_t end_row = (myRank + 1) * p.extent(1);
+    int start_row = myRank * p.extent(1);
+    int end_row = (myRank + 1) * p.extent(1);
     if (end_row > h_x.extent(0))
       end_row = h_x.extent(0);
 
     // CG
-    Kokkos::pair<int64_t, int64_t> bounds(start_row, end_row);
+    Kokkos::pair<int, int> bounds(start_row, end_row);
     Kokkos::View<double *> x_sub = Kokkos::subview(x, bounds);
 
     Kokkos::Timer timer;
@@ -275,8 +277,8 @@ int main(int argc, char *argv[]) {
     double time = timer.seconds();
 
     // Compute Bytes and Flops
-    double spmv_bytes  = A.num_rows() * sizeof(int64_t) +   // A.row_ptr
-                         A.nnz()      * sizeof(int64_t) +   // A.col_idx
+    double spmv_bytes  = A.num_rows() * sizeof(int) +   // A.row_ptr
+                         A.nnz()      * sizeof(int) +   // A.col_idx
                          A.nnz()      * sizeof(double)  +   // A.values
                          A.nnz()      * sizeof(double)  +   // input vector
                          A.num_rows() * sizeof(double);     // output vector

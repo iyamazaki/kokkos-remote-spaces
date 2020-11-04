@@ -49,14 +49,15 @@
 
 #include "KokkosKernels_IOUtils.hpp"
 
-#define CGSOLVE_SPMV_TIMER
+//#define CGSOLVE_SPMV_TIMER
 
-//#define CGSOLVE_GPU_AWARE_MPI
-//#define CGSOLVE_ENABLE_CUBLAS
+#define CGSOLVE_GPU_AWARE_MPI
+#define CGSOLVE_ENABLE_CUBLAS
 #define CGSOLVE_ENABLE_METIS
 
 #if defined(CGSOLVE_ENABLE_CUBLAS)
 #include <cublas_v2.h>
+#include <cusparse.h>
 #endif
 #if defined(CGSOLVE_ENABLE_METIS)
 #include "metis.h"
@@ -245,11 +246,64 @@ struct cgsolve_spmv
     Kokkos::deep_copy(idx_sends, host_idx_sends);
     Kokkos::deep_copy(ngb_sends, host_ngb_sends);
     requests_sends = (MPI_Request*)malloc(num_neighbors_sends * sizeof(MPI_Request));
+
+    #if defined(CGSOLVE_ENABLE_CUBLAS)
+    setup_cusparse();
+    #endif
   }
+
+  #if defined(CGSOLVE_ENABLE_CUBLAS)
+  void setup_cusparse() {
+    cusparseCreate(&cusparseHandle);
+    cusparseCreateMatDescr(&descrA);
+    cusparseSetMatType(descrA, CUSPARSE_MATRIX_TYPE_GENERAL);
+    cusparseSetMatIndexBase(descrA, CUSPARSE_INDEX_BASE_ZERO);
+  }
+
+  void setup_cusparse(YType y, XType x) {
+    cusparseHandle_t cusparseHandle;
+    cusparseCreate(&cusparseHandle);
+
+    int numCols = n;
+    int numRows = h_A.row_ptr.extent(0)-1;
+    int nnz = h_A.row_ptr(n);
+    cusparseSpMatDescr_t A_cusparse;
+    cusparseIndexType_t myCusparseOffsetType = CUSPARSE_INDEX_64I;
+    cusparseIndexType_t myCusparseEntryType  = CUSPARSE_INDEX_64I;
+    cudaDataType        myCudaDataType       = CUDA_R_64F;
+    cusparseCreateCsr(&A_cusparse, numRows, numCols, nnz,
+                      (void*) A.row_ptr.data(),
+                      (void*) A.col_idx.data(),
+                      (void*) A.values.data(),
+                       myCusparseOffsetType,
+                       myCusparseEntryType,
+                       CUSPARSE_INDEX_BASE_ZERO,
+                       myCudaDataType);
+
+    cusparseDnVecDescr_t vecX, vecY;
+    cusparseCreateDnVec(&vecX, x.extent_int(0), (void*) x.data(), myCudaDataType);
+    cusparseCreateDnVec(&vecY, y.extent_int(0), (void*) y.data(), myCudaDataType);
+
+    double alpha = 1.0;
+    double beta  = 0.0;
+    size_t bufferSize = 0;
+    cusparseSpMV_bufferSize(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            &alpha, A_cusparse, vecX, 
+                            &beta,              vecY,
+                            myCudaDataType, CUSPARSE_MV_ALG_DEFAULT,
+                            &bufferSize);
+
+    void*  dBuffer = NULL;
+    cudaMalloc(&dBuffer, bufferSize);
+  }
+  #endif
 
   // -------------------------------------------------------------
   // P2P by MPI
   void exchange(XType x) {
+
+    // quick return
+    if (numRanks <= 0) return;
 
     // prepar recv on host/device
     #if !defined(CGSOLVE_GPU_AWARE_MPI)
@@ -383,47 +437,61 @@ struct cgsolve_spmv
   // -------------------------------------------------------------
   // local SpMV
   void local_apply(YType y, XType x) {
-    #ifdef KOKKOS_ENABLE_CUDA
-    int rows_per_team = 16;
-    int team_size = 16;
+    #if defined(CGSOLVE_ENABLE_CUBLAS)
+     int numCols = n;
+     int numRows = h_A.row_ptr.extent(0)-1;
+     int nnz = h_A.row_ptr(numRows);
+     double alpha = 1.0;
+     double beta  = 0.0;
+     cusparseDcsrmv(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                    numRows, numCols, nnz,
+                    &alpha, descrA,
+                            A.values.data(), A.row_ptr.data(), A.col_idx.data(),
+                            x.data(),
+                    &beta, y.data());
     #else
-    int rows_per_team = 512;
-    int team_size = 1;
-    #endif
+     #ifdef KOKKOS_ENABLE_CUDA
+     int rows_per_team = 16;
+     int team_size = 16;
+     #else
+     int rows_per_team = 512;
+     int team_size = 1;
+     #endif
 
-    int vector_length = 8;
+     int vector_length = 8;
 
-    int64_t nrows = y.extent(0);
+     int nrows = y.extent(0);
 
-    auto policy =
+     auto policy =
       require(Kokkos::TeamPolicy<>((nrows + rows_per_team - 1) / rows_per_team,
                                    team_size, vector_length),
               Kokkos::Experimental::WorkItemProperty::HintHeavyWeight);
-    Kokkos::parallel_for(
-      "spmv", policy,
-      KOKKOS_LAMBDA(const Kokkos::TeamPolicy<>::member_type &team) {
-        const int64_t first_row = team.league_rank() * rows_per_team;
-        const int64_t last_row = first_row + rows_per_team < nrows
-                                     ? first_row + rows_per_team
-                                     : nrows;
+     Kokkos::parallel_for(
+       "spmv", policy,
+       KOKKOS_LAMBDA(const Kokkos::TeamPolicy<>::member_type &team) {
+         const int first_row = team.league_rank() * rows_per_team;
+         const int last_row = first_row + rows_per_team < nrows
+                                      ? first_row + rows_per_team
+                                      : nrows;
 
-        Kokkos::parallel_for(
+         Kokkos::parallel_for(
             Kokkos::TeamThreadRange(team, first_row, last_row),
-            [&](const int64_t row) {
-              const int64_t row_start = A.row_ptr(row);
-              const int64_t row_length = A.row_ptr(row + 1) - row_start;
+            [&](const int row) {
+              const int row_start = A.row_ptr(row);
+              const int row_length = A.row_ptr(row + 1) - row_start;
 
               double y_row = 0.0;
               Kokkos::parallel_reduce(
                   Kokkos::ThreadVectorRange(team, row_length),
-                  [=](const int64_t i, double &sum) {
-                    int64_t idx = A.col_idx(i + row_start);
+                  [=](const int i, double &sum) {
+                    int idx = A.col_idx(i + row_start);
                     sum += A.values(i + row_start) * x(idx);
                   },
                   y_row);
               y(row) = y_row;
             });
       });
+    #endif
   }
 
   // -------------------------------------------------------------
@@ -489,6 +557,11 @@ private:
   mirror_integer_view_t host_idx_sends; // store col indices of elements to receive
 
   bool time_spmv_on;
+
+  #if defined(CGSOLVE_ENABLE_CUBLAS)
+  cusparseHandle_t cusparseHandle;
+  cusparseMatDescr_t descrA;
+  #endif
 };
 
 
@@ -499,7 +572,7 @@ inline void dot(XType x, double &result) {
   result = 0.0;
   Kokkos::parallel_reduce(
       "DOT", x.extent(0),
-      KOKKOS_LAMBDA(const int64_t &i, double &lsum) { lsum += x(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += x(i) * x(i); },
       result);
 }
 
@@ -508,7 +581,7 @@ inline void dot(YType y, XType x, double &result) {
   result = 0.0;
   Kokkos::parallel_reduce(
       "DOT", y.extent(0),
-      KOKKOS_LAMBDA(const int64_t &i, double &lsum) { lsum += y(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += y(i) * x(i); },
       result);
 }
 
@@ -519,7 +592,7 @@ inline void dot(XType x, DType result) {
   Kokkos::deep_copy(result, 0.0);
   Kokkos::parallel_reduce(
       "DOT", x.extent(0),
-      KOKKOS_LAMBDA(const int64_t &i, double &lsum) { lsum += x(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += x(i) * x(i); },
       result);
 }
 
@@ -528,7 +601,7 @@ inline void dot(YType y, XType x, DType result) {
   Kokkos::deep_copy(result, 0.0);
   Kokkos::parallel_reduce(
       "DOT", y.extent(0),
-      KOKKOS_LAMBDA(const int64_t &i, double &lsum) { lsum += y(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += y(i) * x(i); },
       result);
 }
 
@@ -537,7 +610,7 @@ inline void dot(YType y, XType x, DType result) {
 // axpby
 template <class ZType, class YType, class XType>
 void axpby(ZType z, double alpha, XType x, double beta, YType y) {
-  int64_t n = z.extent(0);
+  int n = z.extent(0);
   Kokkos::parallel_for(
       "AXPBY", n,
       KOKKOS_LAMBDA(const int &i) { z(i) = alpha * x(i) + beta * y(i); });
@@ -562,6 +635,9 @@ int cg_solve(VType x, OP op, VType b,
   const double one = 1.0;
   const double zero = 0.0;
 
+  // spmv timer
+  Kokkos::Timer timer_cg;
+  double time_cg = 0.0;
   // spmv timer
   Kokkos::Timer timer_spmv;
   double time_spmv = 0.0;
@@ -612,8 +688,8 @@ int cg_solve(VType x, OP op, VType b,
   Kokkos::View<double*> dot1_dev(dot1_result.data(), 1);
   Kokkos::View<double*> dot2_dev(dot2_result.data(), 1);
 
-  Kokkos::pair<int64_t, int64_t> bound1(0, 1);
-  Kokkos::pair<int64_t, int64_t> bound2(1, 2);
+  Kokkos::pair<int, int> bound1(0, 1);
+  Kokkos::pair<int, int> bound2(1, 2);
   auto dotResult1 = Kokkos::subview(dot_result, bound1);
   auto dotResult2 = Kokkos::subview(dot_result, bound2);
   #endif
@@ -626,12 +702,12 @@ int cg_solve(VType x, OP op, VType b,
 
   // r = b - A*x
   axpby(Ar, zero, x, one, x);   // Ar = x
-  if (time_spmv_on) {
+  /*if (time_spmv_on) {
     Kokkos::fence();
     timer_spmv.reset();
-  }
+  }*/
   op.apply(AAr, Ar_global);     // AAr = A*Ar
-  if (time_spmv_on) {
+  /*if (time_spmv_on) {
     Kokkos::fence();
     time_spmv += timer_spmv.seconds();
     time_spmv_comm   += op.time_comm;
@@ -642,7 +718,7 @@ int cg_solve(VType x, OP op, VType b,
     time_spmv_unpack += op.time_comm_unpack;
     time_spmv_mpi    += op.time_comm_mpi;
     #endif
-  }
+  }*/
   axpby(r, one, b, -one, AAr);  // r = b-AAr
 
   //printf("Init: x, Ax, b, r\n" );
@@ -653,22 +729,29 @@ int cg_solve(VType x, OP op, VType b,
   #if defined(CGSOLVE_GPU_AWARE_MPI)
    #if defined(CGSOLVE_ENABLE_CUBLAS)
    cublasDdot(cublasHandle, nloc, &(dataR[0]), 1, &(dataR[0]), 1, &(dotResult[0]));
-   MPI_Allreduce(MPI_IN_PLACE, &(dotResult[0]), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   if (numRanks > 0) {
+     MPI_Allreduce(MPI_IN_PLACE, &(dotResult[0]), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   }
    Kokkos::deep_copy(dot_host, dot_result); // copy not-needed dot_result(1), too
    beta = dot_host(0);
    #else
    dot(r, r, dot1_result);
-   MPI_Allreduce(MPI_IN_PLACE, dot1_result.data(), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   if (numRanks > 0) {
+     MPI_Allreduce(MPI_IN_PLACE, dot1_result.data(), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   }
    Kokkos::deep_copy(dot1_host, dot1_result);
    beta = (dot1_host.data())[0];
    #endif
   #else
   //printf( " beta = %e\n",beta );
   dot(r, r, beta);
-  MPI_Allreduce(MPI_IN_PLACE, &beta, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  if (numRanks > 0) {
+    MPI_Allreduce(MPI_IN_PLACE, &beta, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  }
   #endif
   // normr = sqrt(beta)
   normr = std::sqrt(beta);
+  tolerance *= normr;
 
   if (verbose && myRank == 0) {
     std::cout << "Initial Residual = " << normr << std::endl;
@@ -677,12 +760,12 @@ int cg_solve(VType x, OP op, VType b,
 
   // Ar = A*r 
   axpby(Ar, one, r, zero, r);      // Ar = r
-  if (time_spmv_on) {
+  /*if (time_spmv_on) {
     Kokkos::fence();
     timer_spmv.reset();
-  }
+  }*/
   op.apply(AAr, Ar_global);        // AAr = A*Ar
-  if (time_spmv_on) {
+  /*if (time_spmv_on) {
     Kokkos::fence();
     time_spmv += timer_spmv.seconds();
     time_spmv_comm   += op.time_comm;
@@ -693,14 +776,17 @@ int cg_solve(VType x, OP op, VType b,
     time_spmv_unpack += op.time_comm_unpack;
     time_spmv_mpi    += op.time_comm_mpi;
     #endif
-  }
+  }*/
   axpby(Ar, one, AAr, zero, AAr);  // Ar = AAr
 
 
   // ---------------------------
   // Main loop
+  Kokkos::fence();
+  MPI_Barrier(MPI_COMM_WORLD);
+  timer_cg.reset();
   int num_iters = 0;
-  for (int64_t k = 1; k <= max_iter && normr > tolerance; ++k) {
+  for (int k = 1; k <= max_iter && normr > tolerance; ++k) {
     if (time_idot_on) {
       Kokkos::fence();
       timer_idot.reset();
@@ -724,9 +810,8 @@ int cg_solve(VType x, OP op, VType b,
      // rAr = r'*Ar
      dot(r, Ar, rAr);
     #endif
-    // fence before calling MPI
-    Kokkos::fence();
     if (time_idot_on) {
+      Kokkos::fence();
       time_idot += timer_idot.seconds();
       timer_idot.reset();
     }
@@ -736,11 +821,19 @@ int cg_solve(VType x, OP op, VType b,
     Kokkos::deep_copy(dotResult2, dot2_dev);
     #endif
     if (idot_option == 1) {
-      MPI_Iallreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
-                     MPI_COMM_WORLD, &request);
+      if (numRanks > 0) {
+        // fence before calling MPI
+        Kokkos::fence();
+        MPI_Iallreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
+                       MPI_COMM_WORLD, &request);
+      }
     } else {
-      MPI_Allreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
-                    MPI_COMM_WORLD);
+      if (numRanks > 0) {
+        // fence before calling MPI
+        Kokkos::fence();
+        MPI_Allreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+      }
       Kokkos::deep_copy(dot_host, dot_result);
       new_rr = dot_host(0);
       rAr = dot_host(1);
@@ -749,11 +842,15 @@ int cg_solve(VType x, OP op, VType b,
     dot_host(0) = new_rr;
     dot_host(1) = rAr;
     if (idot_option == 1) {
-      MPI_Iallreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
-                     MPI_COMM_WORLD, &request);
+      if (numRanks > 0) {
+        MPI_Iallreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
+                       MPI_COMM_WORLD, &request);
+      }
     } else {
-      MPI_Allreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
-                    MPI_COMM_WORLD);
+      if (numRanks > 0) {
+        MPI_Allreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+      }
       new_rr = dot_host(0);
       rAr = dot_host(1);
     }
@@ -786,7 +883,9 @@ int cg_solve(VType x, OP op, VType b,
       timer_idot.reset();
     }
     if (idot_option == 1) {
-      MPI_Wait(&request, &status);
+      if (numRanks > 0) {
+        MPI_Wait(&request, &status);
+      }
       #if defined(CGSOLVE_GPU_AWARE_MPI)
       Kokkos::deep_copy(dot_host, dot_result);
       new_rr = dot_host(0);
@@ -846,6 +945,13 @@ int cg_solve(VType x, OP op, VType b,
 
     num_iters = k;
   }
+  Kokkos::fence();
+  MPI_Barrier(MPI_COMM_WORLD);
+  time_cg = timer_cg.seconds();
+  if (myRank == 0) {
+    std::cout << " > CG Main loop : iter = " << num_iters << " time = " << time_cg << std::endl;
+  }
+
   if (time_spmv_on || time_idot_on) {
     if (myRank == 0) {
       printf( "\n  -------------------------------------------\n\n" );
@@ -941,11 +1047,12 @@ int main(int argc, char *argv[]) {
     int N            = 100;
     int nx           = 0;
     int max_iter     = 200;
-    double tolerance = 1e-9;
+    double tolerance = 1e-8;
     int idot_option  = 0;
     std::string matrixFilename {""};
 
     bool metis       = false;
+    bool sort_matrix  = false;
     bool verbose     = false;
     bool time_idot   = false;
     bool time_spmv   = false;
@@ -971,6 +1078,10 @@ int main(int argc, char *argv[]) {
         max_iter = atoi(argv[++i]);
         continue;
       }
+      if((strcmp(argv[i],"-tol")==0)) {
+        tolerance = atof(argv[++i]);
+        continue;
+      }
       if((strcmp(argv[i],"-idot")==0)) {
         idot_option = atoi(argv[++i]);
         continue;
@@ -985,6 +1096,10 @@ int main(int argc, char *argv[]) {
       }
       if((strcmp(argv[i],"-time-idot")==0)) {
         time_idot = true;
+        continue;
+      }
+      if((strcmp(argv[i],"-sort")==0)) {
+        sort_matrix = true;
         continue;
       }
       #if defined(CGSOLVE_ENABLE_METIS)
@@ -1010,21 +1125,21 @@ int main(int argc, char *argv[]) {
 
     // generate matrix on host
     int *part_map = nullptr;
-    int64_t n = 0;
-    int64_t nlocal = 0;
-    int64_t start_row = 0;
-    int64_t end_row = 0;
+    int n = 0;
+    int nlocal = 0;
+    int start_row = 0;
+    int end_row = 0;
 
     HAType h_A;
     HAType h_G;
     VTypeHost h_b;
     if (matrixFilename != "" || nx > 0) {
       double  *values;
-      int64_t *col_idx;
-      int64_t *row_ptr;
-      int64_t nnz = 0;
+      int *col_idx;
+      int *row_ptr;
+      int nnz = 0;
       if (matrixFilename != "") {
-        KokkosKernels::Impl::read_matrix<int64_t, int64_t, double>(
+        KokkosKernels::Impl::read_matrix<int, int, double>(
           &n, &nnz, &row_ptr, &col_idx, &values, matrixFilename.c_str());
       } else if (nx > 0) {
         h_G = Impl::generate_Laplace_matrix(nx, nx, nx);
@@ -1064,10 +1179,11 @@ int main(int argc, char *argv[]) {
           idx_t objval = 0;
           idx_t *metis_perm = new idx_t[n];
           idx_t *metis_part = new idx_t[n];
-          std::cout << "  + calling METIS_NodeND: (n=" << n << ", nnz=" << nnz << ") " << std::endl;
+          //std::cout << "  + calling METIS_NodeND: (n=" << n << ", nnz=" << nnz << ") " << std::endl;
           //if (METIS_OK != METIS_NodeND(&n_metis, metis_rowptr, metis_colind, NULL, NULL, metis_perm, metis_iperm)) {
           //  std::cout << std::endl << "METIS_NodeND failed" << std::endl << std::endl;
           //}
+          std::cout << "  + calling METIS_PartGraphKway: (n=" << n << ", nnz=" << nnz << ") " << std::endl;
           if (METIS_OK != METIS_PartGraphKway(&n_metis, &ncon, metis_rowptr, metis_colind,
                                               NULL, NULL, NULL, &nparts, NULL, NULL, NULL,
                                               &objval, metis_part)) {
@@ -1082,16 +1198,19 @@ int main(int argc, char *argv[]) {
           delete [] metis_rowptr;
           delete [] metis_colind;
         }
+        // bcast partition and form perm/iperm
         MPI_Bcast(parts, n, MPI_INT, 0, MPI_COMM_WORLD);
         int *perm = new int[n];
         int *iperm = new int[n];
         int *part_ptr = new int[numRanks + 1];
+        // part_ptr points to the begining of each part after ND
         for (int p = 0; p <= numRanks; p++) {
           part_ptr[p] = 0;
         }
         for (int p = 0; p < n; p++) {
           part_ptr[1+parts[p]] ++;
         }
+        // part_map maps row id to part id after ND
         part_map = new int[n];
         for (int p = 0; p < numRanks; p++) {
           part_ptr[p+1] += part_ptr[p];
@@ -1099,7 +1218,8 @@ int main(int argc, char *argv[]) {
             part_map[i] = p;
           }
         }
-        int64_t nnzlocal = 0;
+        // form perm/iperm
+        int nnzlocal = 0;
         for (int i = 0; i < n; i++) {
           int p = parts[i];
           perm[part_ptr[p]] = i;
@@ -1112,13 +1232,15 @@ int main(int argc, char *argv[]) {
           part_ptr[p] = part_ptr[p-1];
         }
         part_ptr[0] = 0;
-        //if (myRank == 0) {
-        //  for (int i = 0; i < n; i++) printf( " perm[%d]=%d iperm[%d]=%d, map[%d]=%d\n",i,perm[i],i,iperm[i],i,part_map[i]);
-        //}
+        /*if (myRank == 0) {
+          //for (int i = 0; i < n; i++) printf( " perm[%d]=%d iperm[%d]=%d, map[%d]=%d\n",i,perm[i],i,iperm[i],i,part_map[i]);
+          for (int i = 0; i < n; i++) printf( " %d %d %d\n",i,perm[i],iperm[i]);
+        }*/
 
+        // form permuted local matrix
         start_row = part_ptr[myRank];
         end_row = part_ptr[myRank+1];
-        Kokkos::View<int64_t *, Kokkos::HostSpace> rowPtr(
+        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
           "Matrix::rowPtr", (end_row - start_row)+1);
         Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
           "Matrix::colInd", nnzlocal);
@@ -1127,9 +1249,9 @@ int main(int argc, char *argv[]) {
 
         nnzlocal = 0;
         rowPtr(0) = 0;
-        for (int64_t id = start_row; id < end_row; id++) {
-          int64_t i = perm[id];
-          for (int64_t k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+        for (int id = start_row; id < end_row; id++) {
+          int i = perm[id];
+          for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
             colInd(nnzlocal) = iperm[col_idx[k]];
             nzVal(nnzlocal) =  values[k];
             nnzlocal ++;
@@ -1149,8 +1271,8 @@ int main(int argc, char *argv[]) {
         if (end_row > n)
           end_row = n;
 
-        int64_t nnzlocal = row_ptr[end_row] - row_ptr[start_row];
-        Kokkos::View<int64_t *, Kokkos::HostSpace> rowPtr(
+        int nnzlocal = row_ptr[end_row] - row_ptr[start_row];
+        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
           "Matrix::rowPtr", (end_row - start_row)+1);
         Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
           "Matrix::colInd", nnzlocal);
@@ -1159,8 +1281,8 @@ int main(int argc, char *argv[]) {
 
         nnzlocal = 0;
         rowPtr(0) = 0;
-        for (int64_t i = start_row; i < end_row; i++) {
-          for (int64_t k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+        for (int i = start_row; i < end_row; i++) {
+          for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
             colInd(nnzlocal) =  col_idx[k];
             nzVal(nnzlocal) =  values[k];
             nnzlocal ++;
@@ -1192,16 +1314,22 @@ int main(int argc, char *argv[]) {
         for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
           int p = h_A.col_idx(k) / MASK;
           int idx = h_A.col_idx(k) % MASK;
-          int64_t start_row = p * nlocal;
+          int start_row = p * nlocal;
           h_A.col_idx(k) = start_row + idx;
         }
       }
     }
+    if (sort_matrix) {
+      if (myRank == 0) {
+        std::cout << "  + sorting matrix .." << std::endl;
+      }
+      Impl::sort_matrix(h_A);
+    }
 
     // copy the matrix to device
     // TODO: move this into op.setup
-    Kokkos::View<int64_t *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
-    Kokkos::View<int64_t *> col_idx("col_idx", h_A.col_idx.extent(0));
+    Kokkos::View<int *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
+    Kokkos::View<int *> col_idx("col_idx", h_A.col_idx.extent(0));
     Kokkos::View<double  *>  values("values",  h_A.values.extent(0));
     AType A(row_ptr, col_idx, values, h_A.num_cols());
     Kokkos::deep_copy(A.row_ptr, h_A.row_ptr);
@@ -1218,14 +1346,14 @@ int main(int argc, char *argv[]) {
     fp = fopen(filename, "w");
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
-        fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
-        //fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
+        //fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
+        fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
       }
     }
     fclose(fp);*/
 
     // local rhs on device
-    Kokkos::pair<int64_t, int64_t> bounds(start_row, end_row);
+    Kokkos::pair<int, int> bounds(start_row, end_row);
     VType b_sub = Kokkos::subview(b, bounds);
 
     // input vector for SpMV
@@ -1241,14 +1369,14 @@ int main(int argc, char *argv[]) {
 
     // call CG
     if (myRank == 0) {
-      int64_t nloc = end_row - start_row;
-      int64_t nnz = h_A.row_ptr(nloc);
+      int nloc = end_row - start_row;
+      int nnz = h_A.row_ptr(nloc);
       if (matrixFilename != "") {
-        std::cout << " calling cg_solve ( matrix = " << matrixFilename;
+        std::cout << std::endl << " calling cg_solve ( matrix = " << matrixFilename;
       } else if (nx > 0) {
-        std::cout << " calling cg_solve ( nx = " << nx;
+        std::cout << std::endl << " calling cg_solve ( nx = " << nx;
       } else {
-        std::cout << " calling cg_solve ( N = " << N;
+        std::cout << std::endl << " calling cg_solve ( N = " << N;
       }
       std::cout << ", n = " << n << ", nloc = " << nloc
                 << ", nnz/nloc = " << double(nnz)/double(nloc)
