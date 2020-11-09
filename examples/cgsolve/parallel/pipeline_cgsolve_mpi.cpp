@@ -188,6 +188,19 @@ struct cgsolve_spmv
     }
     host_ptr_recvs(0) = 0;
 
+    // sort idx to receive from each process
+    Impl::sort_graph(num_neighbors_recvs, host_ptr_recvs.data(), host_idx_recvs.data()); 
+
+
+    /*if (myRank == 0) {
+      for (int q = 0; q < num_neighbors_recvs; q++) {
+        int p = host_ngb_recvs(q);
+        for (int k = host_ptr_recvs(q); k < host_ptr_recvs(q+1); k++ ) {
+          printf( "%d %d %d\n",q,p,host_idx_recvs(k) );
+        }
+      }
+    }*/
+
     Kokkos::deep_copy(num_recvs, host_num_recvs);
     Kokkos::deep_copy(ptr_recvs, host_ptr_recvs);
     Kokkos::deep_copy(idx_recvs, host_idx_recvs);
@@ -241,6 +254,9 @@ struct cgsolve_spmv
       }
     }
     #endif
+
+    // sort idx to send to each process
+    Impl::sort_graph(num_neighbors_sends, host_ptr_sends.data(), host_idx_sends.data()); 
 
     Kokkos::deep_copy(ptr_sends, host_ptr_sends);
     Kokkos::deep_copy(idx_sends, host_idx_sends);

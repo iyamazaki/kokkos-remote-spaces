@@ -369,7 +369,6 @@ static CrsMatrix<Kokkos::HostSpace> generate_Laplace_matrix(int nx, int ny, int 
 }
 
 static void sort_matrix(CrsMatrix<Kokkos::HostSpace> &matrix) {
-
   // bouble-sort col_idx in each row
   int n = matrix.row_ptr.extent(0)-1;
   for (int i = 0; i < n; i++) {
@@ -385,6 +384,24 @@ static void sort_matrix(CrsMatrix<Kokkos::HostSpace> &matrix) {
 
           matrix.values[k2] = val;
           matrix.col_idx[k2] = idx;
+        } else {
+          break;
+        }
+      }
+    }
+  }
+}
+
+static void sort_graph(int n, int *row_ptr, int *col_idx) {
+  // bouble-sort col_idx in each row
+  for (int i = 0; i < n; i++) {
+    for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+      for (int k2 = k-1; k2 >= row_ptr[i]; k2--) {
+        int k1 = k2+1; 
+        if (col_idx[k1] < col_idx[k2]) {
+          int idx = col_idx[k1];
+          col_idx[k1] = col_idx[k2];
+          col_idx[k2] = idx;
         } else {
           break;
         }
