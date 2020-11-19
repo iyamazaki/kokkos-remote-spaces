@@ -58,7 +58,7 @@
 //#define CGSOLVE_ENABLE_CUBLAS_DOT
 #define CGSOLVE_ENABLE_METIS
 
-#if defined(CGSOLVE_ENABLE_CUBLAS)
+#if defined(KOKKOS_ENABLE_CUDA)
 #include <cublas_v2.h>
 #include <cusparse.h>
 #endif
@@ -267,12 +267,12 @@ struct cgsolve_spmv
     Kokkos::deep_copy(ngb_sends, host_ngb_sends);
     requests_sends = (MPI_Request*)malloc(num_neighbors_sends * sizeof(MPI_Request));
 
-    #if defined(CGSOLVE_ENABLE_CUBLAS)
+    #if defined(KOKKOS_ENABLE_CUDA)
     setup_cusparse();
     #endif
   }
 
-  #if defined(CGSOLVE_ENABLE_CUBLAS)
+  #if defined(KOKKOS_ENABLE_CUDA)
   void setStream(cudaStream_t *cudaStream_) {
     if (*cudaStream_ != NULL) {
       cudaStream = cudaStream_;
@@ -332,7 +332,7 @@ struct cgsolve_spmv
   // -------------------------------------------------------------
   // P2P by MPI
   void fence() {
-    #if defined(CGSOLVE_ENABLE_CUBLAS)
+    #if defined(KOKKOS_ENABLE_CUDA)
     if (use_stream) {
       cudaStreamSynchronize(*cudaStream);
     } else {
@@ -382,12 +382,13 @@ struct cgsolve_spmv
     }
     #endif
     SpaceType space;
+    #if defined(KOKKOS_ENABLE_CUDA)
     if (use_stream) {
       space = SpaceType (*cudaStream);
     }
+    #endif
     int num_neighbors_sends = ngb_sends.extent(0);
-    //team_policy_type send_policy (space, max_num_sends, Kokkos::AUTO);
-    team_policy_type send_policy (max_num_sends, Kokkos::AUTO);
+    team_policy_type send_policy (space, max_num_sends, Kokkos::AUTO);
     Kokkos::parallel_for(send_policy,
       KOKKOS_LAMBDA(const member_type & team) {
         int k = team.league_rank();
@@ -458,8 +459,7 @@ struct cgsolve_spmv
     #endif
 
     // unpack on device
-    //team_policy_type recv_policy (space, max_num_recvs, Kokkos::AUTO);
-    team_policy_type recv_policy (max_num_recvs, Kokkos::AUTO);
+    team_policy_type recv_policy (space, max_num_recvs, Kokkos::AUTO);
     Kokkos::parallel_for(recv_policy,
       KOKKOS_LAMBDA(const member_type & team) {
         int k = team.league_rank();
@@ -508,7 +508,7 @@ struct cgsolve_spmv
                             x.data(),
                     &beta, y.data());
     #else
-     #ifdef KOKKOS_ENABLE_CUDA
+     #if defined(KOKKOS_ENABLE_CUDA)
      int rows_per_team = 16;
      int team_size = 16;
      #else
@@ -616,8 +616,8 @@ private:
 
   bool time_spmv_on;
 
-  #if defined(CGSOLVE_ENABLE_CUBLAS)
   bool use_stream;
+  #if defined(KOKKOS_ENABLE_CUDA)
   cusparseHandle_t cusparseHandle;
   cudaStream_t    *cudaStream;
   cusparseMatDescr_t descrA;
@@ -809,7 +809,7 @@ int cg_solve(VType x, OP op, VType b,
   #endif
 
   int nloc = r.extent(0);
-  #if defined(CGSOLVE_ENABLE_CUBLAS)
+  #if defined(KOKKOS_ENABLE_CUDA)
   cudaStream_t cudaStream[2];
   cublasHandle_t cublasHandle;
 
@@ -833,57 +833,19 @@ int cg_solve(VType x, OP op, VType b,
 
   // r = b - A*x
   axpby(Ar, zero, x, one, x);   // Ar = x
-  /*if (time_spmv_on) {
-    Kokkos::fence();
-    timer_spmv.reset();
-  }*/
   op.apply(AAr, Ar_global);     // AAr = A*Ar
-  /*if (time_spmv_on) {
-    Kokkos::fence();
-    time_spmv += timer_spmv.seconds();
-    time_spmv_comm   += op.time_comm;
-    time_spmv_spmv   += op.time_spmv;
-    #if defined(CGSOLVE_SPMV_TIMER)
-    time_spmv_copy   += op.time_comm_copy;
-    time_spmv_pack   += op.time_comm_pack;
-    time_spmv_unpack += op.time_comm_unpack;
-    time_spmv_mpi    += op.time_comm_mpi;
-    #endif
-  }*/
   axpby(r, one, b, -one, AAr);  // r = b-AAr
 
   //printf("Init: x, Ax, b, r\n" );
   //Kokkos::fence();
   //for (int i=0; i<b.extent(0); i++) printf(" %e, %e, %e, %e\n",x(i),AAr(i),b(i),r(i));
 
-  // beta = r'*r
-  #if defined(CGSOLVE_GPU_AWARE_MPI)
-   #if defined(CGSOLVE_ENABLE_CUBLAS_DOT)
-   cublasDdot(cublasHandle, nloc, &(dataR[0]), 1, &(dataR[0]), 1, &(dotResult[0]));
-   if (numRanks > 0) {
-     Kokkos::fence();
-     MPI_Allreduce(MPI_IN_PLACE, &(dotResult[0]), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-   }
-   Kokkos::deep_copy(dot_host, dot_result); // copy not-needed dot_result(1), too
-   beta = dot_host(0);
-   #else
-   dot(r, r, dot1_result);
-   if (numRanks > 0) {
-     Kokkos::fence();
-     MPI_Allreduce(MPI_IN_PLACE, dot1_result.data(), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-   }
-   Kokkos::deep_copy(dot1_host, dot1_result);
-   beta = (dot1_host.data())[0];
-   #endif
-  #else
-  //printf( " beta = %e\n",beta );
+  // beta = r'*r (using Kokkos and non Cuda-aware MPI)
   dot(r, r, beta);
   if (numRanks > 0) {
     Kokkos::fence();
     MPI_Allreduce(MPI_IN_PLACE, &beta, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   }
-  #endif
-  // normr = sqrt(beta)
   normr = std::sqrt(beta);
   tolerance *= normr;
 
@@ -893,24 +855,8 @@ int cg_solve(VType x, OP op, VType b,
   //double brkdown_tol = std::numeric_limits<double>::epsilon();
 
   // Ar = A*r 
-  axpby(Ar, one, r, zero, r);      // Ar = r
-  /*if (time_spmv_on) {
-    Kokkos::fence();
-    timer_spmv.reset();
-  }*/
+  axpby(Ar, one,   r, zero,   r);  // Ar = r
   op.apply(AAr, Ar_global);        // AAr = A*Ar
-  /*if (time_spmv_on) {
-    Kokkos::fence();
-    time_spmv += timer_spmv.seconds();
-    time_spmv_comm   += op.time_comm;
-    time_spmv_spmv   += op.time_spmv;
-    #if defined(CGSOLVE_SPMV_TIMER)
-    time_spmv_copy   += op.time_comm_copy;
-    time_spmv_pack   += op.time_comm_pack;
-    time_spmv_unpack += op.time_comm_unpack;
-    time_spmv_mpi    += op.time_comm_mpi;
-    #endif
-  }*/
   axpby(Ar, one, AAr, zero, AAr);  // Ar = AAr
 
 
@@ -945,7 +891,7 @@ int cg_solve(VType x, OP op, VType b,
      }
      #else
      if (idot_option == 2) {
-       cudaStreamSynchronize(cudaStream[0]); // synch for r
+       cudaStreamSynchronize(cudaStream[0]); // synch for r & Ar
        // beta = r'*r on cudaStream[1]
        dot_stream(r, dot1_result, cudaSpace1);
        // rAr = r'*Ar on cudaStream[1]
@@ -957,7 +903,7 @@ int cg_solve(VType x, OP op, VType b,
        dot(r, Ar, dot2_result);
      }
      #endif
-    #else
+    #else // not GPU_AWARE_MPI
      // beta = r'*r
      dot(r, r, new_rr);
      // rAr = r'*Ar
@@ -995,7 +941,7 @@ int cg_solve(VType x, OP op, VType b,
       new_rr = dot_host(0);
       rAr = dot_host(1);
     }
-    #else
+    #else // not GPU_AWARE_MPI
     dot_host(0) = new_rr;
     dot_host(1) = rAr;
     if (idot_option == 1) {
@@ -1020,13 +966,16 @@ int cg_solve(VType x, OP op, VType b,
     // ==============================================================================
     // AAr = A*Ar
     if (time_spmv_on) {
-      //Kokkos::fence();
       timer_spmv.reset();
     }
     op.apply(AAr, Ar_global);
     if (time_spmv_on) {
-      #if defined(CGSOLVE_ENABLE_CUBLAS)
-      cudaStreamSynchronize(cudaStream[0]);
+      #if defined(CGSOLVE_GPU_AWARE_MPI)
+      if (idot_option == 2) {
+        cudaStreamSynchronize(cudaStream[0]);
+      } else {
+        Kokkos::fence();
+      }
       #else
       Kokkos::fence();
       #endif
@@ -1049,47 +998,57 @@ int cg_solve(VType x, OP op, VType b,
         timer_idot.reset();
       }
       if (numRanks > 0) {
+        // wait on non-blocking Iallreduce
         MPI_Wait(&request, &status);
       }
       #if defined(CGSOLVE_GPU_AWARE_MPI)
       Kokkos::deep_copy(dot_host, dot_result);
-      new_rr = dot_host(0);
-      rAr = dot_host(1);
-      #else
-      new_rr = dot_host(0);
-      rAr = dot_host(1);
       #endif
+      new_rr = dot_host(0);
+      rAr = dot_host(1);
       if (time_idot_on) {
         time_idot_wait += timer_idot.seconds();
       }
-    } else if (idot_option == 2) {
+    }
+    #if defined(CGSOLVE_GPU_AWARE_MPI)
+    else if (idot_option == 2) {
       // synch local dot
       if (time_idot_on) {
         timer_idot.reset();
       }
-      #if defined(CGSOLVE_ENABLE_CUBLAS_DOT)
-      // either by cublas or kokkos+stream
-      Kokkos::deep_copy(cudaSpace1, dotResult1, dot1_dev);
-      Kokkos::deep_copy(cudaSpace1, dotResult2, dot2_dev);
-      cudaStreamSynchronize(cudaStream[1]);
-      #else
-      Kokkos::deep_copy(dot_host, dot_result);
+      #if defined(KOKKOS_ENABLE_CUDA)
+       // synch local dot
+       #if !defined(CGSOLVE_ENABLE_CUBLAS_DOT)
+       // either by cublas or kokkos+stream
+       Kokkos::deep_copy(cudaSpace1, dotResult1, dot1_dev);
+       Kokkos::deep_copy(cudaSpace1, dotResult2, dot2_dev);
+       #endif
+       cudaStreamSynchronize(cudaStream[1]);
       #endif
       if (time_idot_on) {
         time_idot_wait += timer_idot.seconds();
         timer_idot.reset();
       }
+      #if defined(CGSOLVE_GPU_AWARE_MPI)
       if (numRanks > 0) {
         MPI_Allreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
       }
       Kokkos::deep_copy(dot_host, dot_result);
+      #else
+      Kokkos::deep_copy(dot_host, dot_result);
+      if (numRanks > 0) {
+        MPI_Allreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
+                      MPI_COMM_WORLD);
+      }
+      #endif
       new_rr = dot_host(0);
       rAr = dot_host(1);
       if (time_idot_on) {
         time_idot_comm += timer_idot.seconds();
       }
     }
+    #endif
 
 
     // ==============================================================================
@@ -1234,7 +1193,7 @@ int cg_solve(VType x, OP op, VType b,
         #endif
         printf( "    + time(SpMV)::comp    =  %.2e ~ %.2e seconds\n",min_comp,  max_comp );
       }
-      printf( "    xx %d: time(SpMV)::comm    =  %.2e seconds\n",myRank, time_spmv_mpi );
+      //printf( "    xx %d: time(SpMV)::comm    =  %.2e seconds\n",myRank, time_spmv_mpi );
       //printf( "    xx %d: time(SpMV)::comp    =  %.2e seconds (nlocal = %d, nnzlocal = %d)\n",myRank, time_spmv_spmv, 
       //        op.getLocalDim(), op.getLocalNnz());
     }
@@ -1267,9 +1226,11 @@ int cg_solve(VType x, OP op, VType b,
   cublasDestroy(cublasHandle);
   cudaStreamDestroy(cudaStream[0]);
   cudaStreamDestroy(cudaStream[1]);
+  #if defined(CGSOLVE_GPU_AWARE_MPI)
   if (idot_option == 2) {
     op.unsetStream();
   }
+  #endif
   #endif
 
   return num_iters;
@@ -1337,7 +1298,12 @@ int main(int argc, char *argv[]) {
       }
       if((strcmp(argv[i],"-idot")==0)) {
         int new_option = atoi(argv[++i]);
-        if (new_option > 2) {
+        #if defined(CGSOLVE_GPU_AWARE_MPI)
+        if (new_option > 2)
+        #else
+        if (new_option > 1)
+        #endif
+        {
           std::cout << std::endl << " Invalid idot option" << std::endl << std::endl;
         } else {
           idot_option = new_option;
@@ -1624,8 +1590,15 @@ int main(int argc, char *argv[]) {
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
         //fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
-        fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
+        //fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
+        printf("%d %d %e\n",i,h_A.col_idx(k),h_A.values(k) );
       }
+    }
+    fclose(fp);
+    sprintf(filename,"b%d_%d.dat",numRanks, myRank);
+    fp = fopen(filename, "w");
+    for (int i=0; i<h_b.extent(0); i++) {
+      printf("%e\n",h_b(i));
     }
     fclose(fp);*/
 
