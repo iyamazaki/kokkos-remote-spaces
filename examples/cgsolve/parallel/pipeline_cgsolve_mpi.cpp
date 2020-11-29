@@ -50,7 +50,7 @@
 #include "KokkosKernels_IOUtils.hpp"
 
 // more detailed timer for SpMV
-#define CGSOLVE_SPMV_TIMER
+//#define CGSOLVE_SPMV_TIMER
 
 // different options for CGsolver
 #define CGSOLVE_GPU_AWARE_MPI
@@ -276,6 +276,7 @@ struct cgsolve_spmv
   void setStream(cudaStream_t *cudaStream_) {
     if (*cudaStream_ != NULL) {
       cudaStream = cudaStream_;
+      space = SpaceType (*cudaStream);
       cusparseSetStream(cusparseHandle, *cudaStream);
       use_stream = true;
     }
@@ -381,12 +382,6 @@ struct cgsolve_spmv
       timer.reset();
     }
     #endif
-    SpaceType space;
-    #if defined(KOKKOS_ENABLE_CUDA)
-    if (use_stream) {
-      space = SpaceType (*cudaStream);
-    }
-    #endif
     int num_neighbors_sends = ngb_sends.extent(0);
     team_policy_type send_policy (space, max_num_sends, Kokkos::AUTO);
     Kokkos::parallel_for(send_policy,
@@ -443,6 +438,7 @@ struct cgsolve_spmv
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       time_comm_mpi += timer.seconds();
+      time_comm_wait_recv = timer.seconds();
       timer.reset();
     }
     #endif
@@ -488,6 +484,7 @@ struct cgsolve_spmv
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       time_comm_mpi += timer.seconds();
+      time_comm_wait_send = timer.seconds();
     }
     #endif
   }
@@ -579,6 +576,8 @@ struct cgsolve_spmv
   double time_comm_pack;
   double time_comm_unpack;
   double time_comm_mpi;
+  double time_comm_wait_send;
+  double time_comm_wait_recv;
   double time_spmv;
 
 private:
@@ -621,6 +620,8 @@ private:
   cusparseHandle_t cusparseHandle;
   cudaStream_t    *cudaStream;
   cusparseMatDescr_t descrA;
+
+  SpaceType space;
   #endif
 };
 
@@ -759,6 +760,8 @@ int cg_solve(VType x, OP op, VType b,
   double time_spmv_pack   = 0.0;
   double time_spmv_unpack = 0.0;
   double time_spmv_mpi    = 0.0;
+  double time_spmv_wait_send = 0.0;
+  double time_spmv_wait_recv = 0.0;
   #endif
   // idot timer
   Kokkos::Timer timer_idot;
@@ -987,6 +990,8 @@ int cg_solve(VType x, OP op, VType b,
       time_spmv_pack   += op.time_comm_pack;
       time_spmv_unpack += op.time_comm_unpack;
       time_spmv_mpi    += op.time_comm_mpi;
+      time_spmv_wait_send += op.time_comm_wait_send;
+      time_spmv_wait_recv += op.time_comm_wait_recv;
       #endif
     }
 
@@ -1142,6 +1147,8 @@ int cg_solve(VType x, OP op, VType b,
 
     num_iters = k;
   }
+  cudaStreamSynchronize(cudaStream[0]);
+  cudaStreamSynchronize(cudaStream[1]);
   Kokkos::fence();
   MPI_Barrier(MPI_COMM_WORLD);
   time_cg = timer_cg.seconds();
@@ -1173,6 +1180,14 @@ int cg_solve(VType x, OP op, VType b,
       double min_mpi = 0.0, max_mpi = 0.0;
       MPI_Allreduce(&time_spmv_mpi, &min_mpi, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
       MPI_Allreduce(&time_spmv_mpi, &max_mpi, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+      double min_wait_send = 0.0, max_wait_send = 0.0;
+      MPI_Allreduce(&time_spmv_wait_send, &min_wait_send, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+      MPI_Allreduce(&time_spmv_wait_send, &max_wait_send, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+      double min_wait_recv = 0.0, max_wait_recv = 0.0;
+      MPI_Allreduce(&time_spmv_wait_recv, &min_wait_recv, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+      MPI_Allreduce(&time_spmv_wait_recv, &max_wait_recv, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
       #endif
 
       double min_comp = 0.0, max_comp = 0.0;
@@ -1190,9 +1205,13 @@ int cg_solve(VType x, OP op, VType b,
         printf( "     > time(SpMV)::pack    =  %.2e ~ %.2e seconds\n",min_pack,  max_pack );
         printf( "     > time(SpMV)::unpack  =  %.2e ~ %.2e seconds\n",min_unpack,max_unpack );
         printf( "     > time(SpMV)::mpi     =  %.2e ~ %.2e seconds\n",min_mpi,   max_mpi  );
+
+        printf( "      - time(SpMV)::wait_send =  %.2e ~ %.2e seconds\n",min_wait_send, max_wait_send );
+        printf( "      - time(SpMV)::wait_recv =  %.2e ~ %.2e seconds\n",min_wait_recv, max_wait_recv );
         #endif
         printf( "    + time(SpMV)::comp    =  %.2e ~ %.2e seconds\n",min_comp,  max_comp );
       }
+      //printf( "    xx %d: time(SpMV)::wait    =  %.2e + %.2e seconds\n",myRank, time_spmv_wait_send,time_spmv_wait_recv );
       //printf( "    xx %d: time(SpMV)::comm    =  %.2e seconds\n",myRank, time_spmv_mpi );
       //printf( "    xx %d: time(SpMV)::comp    =  %.2e seconds (nlocal = %d, nnzlocal = %d)\n",myRank, time_spmv_spmv, 
       //        op.getLocalDim(), op.getLocalNnz());
@@ -1222,15 +1241,13 @@ int cg_solve(VType x, OP op, VType b,
       printf( "\n  -------------------------------------------\n" );
     }
   }
-  #if defined(CGSOLVE_ENABLE_CUBLAS)
+  #if defined(KOKKOS_ENABLE_CUDA)
   cublasDestroy(cublasHandle);
   cudaStreamDestroy(cudaStream[0]);
   cudaStreamDestroy(cudaStream[1]);
-  #if defined(CGSOLVE_GPU_AWARE_MPI)
   if (idot_option == 2) {
     op.unsetStream();
   }
-  #endif
   #endif
 
   return num_iters;
