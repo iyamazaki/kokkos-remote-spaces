@@ -293,6 +293,7 @@ struct cgsolve_spmv
     cusparseSetMatIndexBase(descrA, CUSPARSE_INDEX_BASE_ZERO);
   }
 
+  #if 0
   void setup_cusparse(YType y, XType x) {
     cusparseCreate(&cusparseHandle);
 
@@ -328,6 +329,7 @@ struct cgsolve_spmv
     void*  dBuffer = NULL;
     cudaMalloc(&dBuffer, bufferSize);
   }
+  #endif
   #endif
 
   // -------------------------------------------------------------
