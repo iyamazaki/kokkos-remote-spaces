@@ -931,17 +931,14 @@ int cg_solve(VType x, OP op, VType b,
 
     // ==============================================================================
     // start idot
-    if (time_idot_on) {
-      if (idot_option != 2) {
-        Kokkos::fence();
-      }
-      timer_idot.reset();
-    }
     #if defined(CGSOLVE_GPU_AWARE_MPI)
      #if defined(CGSOLVE_ENABLE_CUBLAS_DOT)
      if (idot_option == 2) {
        cudaStreamSynchronize(cudaStream[0]); // synch for r & Ar
        cublasSetStream(cublasHandle, cudaStream[1]);
+     }
+     if (time_idot_on) {
+       timer_idot.reset();
      }
      // beta = r'*r
      cublasDdot(cublasHandle, nloc, &(dataR[0]), 1, &(dataR[0]), 1, &(dotResult[0]));
@@ -954,6 +951,9 @@ int cg_solve(VType x, OP op, VType b,
      if (idot_option == 2) {
        cudaStreamSynchronize(cudaStream[0]); // synch for r & Ar
        cublasSetStream(cublasHandle, cudaStream[1]);
+       if (time_idot_on) {
+         timer_idot.reset();
+       }
        #define USE_MERGED_DOTS
        #if defined(USE_MERGED_DOTS)
        using SpaceType = Kokkos::Cuda;
@@ -974,6 +974,9 @@ int cg_solve(VType x, OP op, VType b,
        #endif
        cublasSetStream(cublasHandle, cudaStream[0]);
      } else {
+       if (time_idot_on) {
+         timer_idot.reset();
+       }
        #if defined(USE_MERGED_DOTS)
        using SpaceType = Kokkos::Cuda;
        using range_policy_t = Kokkos::RangePolicy<SpaceType>;
