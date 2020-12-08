@@ -710,7 +710,7 @@ struct dots_stream {
   using size_type = typename XType::size_type;
 
   dots_stream (XType x_, YType y_, DType result_) :
-  value_count (x.extent(1)),
+  value_count (result_.extent(0)),
   result (result_),
   x (x_),
   y (y_)
@@ -729,15 +729,15 @@ struct dots_stream {
     dst[1] += src[1];
   }
     
-  KOKKOS_INLINE_FUNCTION void init (value_type result) const {
+  KOKKOS_INLINE_FUNCTION void init (value_type dst) const {
     const scalar_type zero (0.0);
-
-    result[0] = zero;
-    result[1] = zero;
+    dst[0] = zero;
+    dst[1] = zero;
   }
 
   size_type value_count;
 
+  DType result;
   XType x;
   YType y;
 };
@@ -954,26 +954,43 @@ int cg_solve(VType x, OP op, VType b,
      if (idot_option == 2) {
        cudaStreamSynchronize(cudaStream[0]); // synch for r & Ar
        cublasSetStream(cublasHandle, cudaStream[1]);
+       #define USE_MERGED_DOTS
+       #if defined(USE_MERGED_DOTS)
+       using SpaceType = Kokkos::Cuda;
+       using range_policy_t = Kokkos::RangePolicy<SpaceType>;
+       // beta = r'*r on cudaStream[1]
+       // rAr = r'*Ar on cudaStream[1]
+       dots_stream<VType, VType, DView> dots2 (r, Ar, dot_result);
+       Kokkos::parallel_reduce(
+         "dots_stream(r^t * r, r^t * A * r)",
+         range_policy_t(cudaSpace1, 0, r.extent(0)),
+         dots2,
+         dot_result);
+       #else
        // beta = r'*r on cudaStream[1]
        dot_stream(r, dot1_result, cudaSpace1);
        // rAr = r'*Ar on cudaStream[1]
        dot_stream(r, Ar, dot2_result, cudaSpace1);
-#if 1
+       #endif
+       cublasSetStream(cublasHandle, cudaStream[0]);
+     } else {
+       #if defined(USE_MERGED_DOTS)
        using SpaceType = Kokkos::Cuda;
        using range_policy_t = Kokkos::RangePolicy<SpaceType>;
-       dots_stream<VType, VType, DView> dots2 (dotResult, r, Ar, dot_result);
+       // beta = r'*r on default stream
+       // rAr = r'*Ar on default stream
+       dots_stream<VType, VType, DView> dots2 (r, Ar, dot_result);
        Kokkos::parallel_reduce(
          "dots_stream(r^t * r, r^t * A * r)",
          range_policy_t(0, r.extent(0)),
          dots2,
          dot_result);
-#endif
-       cublasSetStream(cublasHandle, cudaStream[0]);
-     } else {
+       #else
        // beta = r'*r
        dot(r, dot1_result);
        // rAr = r'*Ar
        dot(r, Ar, dot2_result);
+       #endif
      }
      #endif
     #else // not GPU_AWARE_MPI
@@ -992,8 +1009,10 @@ int cg_solve(VType x, OP op, VType b,
     #if defined(CGSOLVE_GPU_AWARE_MPI)
     #if !defined(CGSOLVE_ENABLE_CUBLAS_DOT)
     if (idot_option != 2) {
+      #if !defined(USE_MERGED_DOTS)
       Kokkos::deep_copy(dotResult1, dot1_dev);
       Kokkos::deep_copy(dotResult2, dot2_dev);
+      #endif
     }
     #endif
     if (idot_option == 1) {
@@ -1095,8 +1114,10 @@ int cg_solve(VType x, OP op, VType b,
        // synch local dot
        #if !defined(CGSOLVE_ENABLE_CUBLAS_DOT)
        // either by cublas or kokkos+stream
+       #if !defined(USE_MERGED_DOTS)
        Kokkos::deep_copy(cudaSpace1, dotResult1, dot1_dev);
        Kokkos::deep_copy(cudaSpace1, dotResult2, dot2_dev);
+       #endif
        #endif
        cudaStreamSynchronize(cudaStream[1]);
       #endif
