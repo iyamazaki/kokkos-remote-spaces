@@ -75,7 +75,7 @@
 using host_execution_space = typename Kokkos::HostSpace;
 using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
-using memory_space = typename execution_space::memory_space;
+using         memory_space = typename execution_space::memory_space;
 
 
 // -------------------------------------------------------------
@@ -836,8 +836,6 @@ int cg_solve(VType x, OP op, VType b,
   Kokkos::Timer timer_axpy;
   double time_axpy = 0.0;
   double flop_axpy = 0.0;
-  double time_axpby = 0.0;
-  double flop_axpby = 0.0;
 
   double normr = zero;
   double alpha = zero;
@@ -950,6 +948,9 @@ int cg_solve(VType x, OP op, VType b,
 
     // ==============================================================================
     // Matrix-Powers Kernel
+    if (time_spmv_on) {
+      timer_spmv.reset();
+    }
     auto r0 = getCol<VType> (0, R);
     auto p0 = getCol<VType> (0, P);
     auto p1 = getCol<VType> (1, P);
@@ -967,18 +968,51 @@ int cg_solve(VType x, OP op, VType b,
       Kokkos::deep_copy(p, pj0);
       op.apply(pj1, p_global);
     }
+    if (time_spmv_on) {
+      Kokkos::fence();
+      time_spmv += timer_spmv.seconds();
+      time_spmv_comm   += op.time_comm;
+      time_spmv_spmv   += op.time_spmv;
+      #if defined(CGSOLVE_SPMV_TIMER)
+      time_spmv_copy   += op.time_comm_copy;
+      time_spmv_pack   += op.time_comm_pack;
+      time_spmv_unpack += op.time_comm_unpack;
+      time_spmv_mpi    += op.time_comm_mpi;
+      time_spmv_wait_send += op.time_comm_wait_send;
+      time_spmv_wait_recv += op.time_comm_wait_recv;
+      #endif
+    }
 
+    // ==============================================================================
+    // Dot-product
+    if (time_dot_on) {
+      Kokkos::fence();
+      timer_dot.reset();
+    }
     #if defined(CGSOLVE_ENABLE_CUBLAS)
     cublasDgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
                 2*s+1, 2*s+1, nloc, &(one),  V.data(), nloc,
                                              V.data(), nloc,
                                     &(zero), G_device.data(), 2*s+1);
-    Kokkos::deep_copy(G, G_device);
     #else
     KokkosBlas::Impl::DotBasedGEMM<execution_space, MType, MType, MType>
       TS_GEMM (one, V, V, zero, G);
     TS_GEMM.run (true);
     #endif
+    if (time_dot_on) {
+      Kokkos::fence();
+      time_dot += timer_dot.seconds();
+      flop_dot += (2*s+1)*(2*s+1)*(2*nloc-1);
+      timer_dot.reset();
+    }
+
+    Kokkos::deep_copy(G, G_device);
+    if (time_dot_on) {
+      time_dot_comm += timer_dot.seconds();
+    }
+
+    // ==============================================================================
+    // Convergence check (delayed)
     new_rr = G(s+1, s+1);
     normr = std::sqrt(new_rr);
     if (normr <= tolerance) break;
@@ -999,6 +1033,8 @@ int cg_solve(VType x, OP op, VType b,
     printf("];\n");
     #endif
 
+    // ==============================================================================
+    // Compute "alpha" & "beta" (local redundant compute)
     auto t0 = getCol<VType_host> (0, t);
     auto c0 = getCol<VType_host> (0, c);
     auto y0 = getCol<VType_host> (0, y);
@@ -1123,6 +1159,9 @@ int cg_solve(VType x, OP op, VType b,
     auto y1 = getCol<VType> (s, y_device);
     auto t1 = getCol<VType> (s, t_device);
     auto c1 = getCol<VType> (s, c_device);
+    if (time_axpy_on) {
+      timer_axpy.reset();
+    }
     cublasDgemv(cublasHandle, CUBLAS_OP_N,
                 nloc, 2*s+1, &(one),   V.data(), nloc,
                                       y1.data(), 1,
@@ -1135,6 +1174,11 @@ int cg_solve(VType x, OP op, VType b,
                 nloc, 2*s+1, &(one),   V.data(), nloc,
                                       c1.data(), 1,
                              &(zero),  p.data(), 1);
+    if (time_axpy_on) {
+      Kokkos::fence();
+      time_axpy += timer_axpy.seconds();
+      flop_axpy += 3*(4*s)*nloc;
+    }
     #if defined(KOKKOS_DEBUG_CGSOLVER)
     Kokkos::deep_copy(V_host, V);
     printf(" > V = [\n" );
@@ -1264,8 +1308,6 @@ int cg_solve(VType x, OP op, VType b,
         printf( "\n" );
         printf( "   Gflop/s( axpy)           = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
         printf( "   time   ( axpy)           = %.2e seconds\n", time_axpy );
-        printf( "   Gflop/s(axpby)           = %.2e (%.2e flops)\n", flop_axpby/(1e9*time_axpy), flop_axpby );
-        printf( "   time   (axpby)           = %.2e seconds\n", time_axpby );
       }
       printf( "\n  -------------------------------------------\n" );
     }

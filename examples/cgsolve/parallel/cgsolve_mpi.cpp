@@ -937,8 +937,9 @@ int cg_solve(VType x, OP op, VType b,
       // p = r + beta*p
       if (time_axpy_on) {
         Kokkos::fence();
+        timer_axpy.reset();
       }
-      #if defined(CGSOLVE_ENABLE_CUBLAS)
+      #if 0//defined(CGSOLVE_ENABLE_CUBLAS)
       cublasDscal(cublasHandle, nloc, &(beta), p.data(), 1);
       cublasDaxpy(cublasHandle, nloc, &(one),  r.data(), 1, p.data(), 1);
       #else
@@ -1129,7 +1130,7 @@ int cg_solve(VType x, OP op, VType b,
         printf( "\n" );
         printf( "   Gflop/s( axpy)           = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
         printf( "   time   ( axpy)           = %.2e seconds\n", time_axpy );
-        printf( "   Gflop/s(axpby)           = %.2e (%.2e flops)\n", flop_axpby/(1e9*time_axpy), flop_axpby );
+        printf( "   Gflop/s(axpby)           = %.2e (%.2e flops)\n", flop_axpby/(1e9*time_axpby), flop_axpby );
         printf( "   time   (axpby)           = %.2e seconds\n", time_axpby );
       }
       printf( "\n  -------------------------------------------\n" );
