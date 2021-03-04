@@ -113,8 +113,14 @@ struct cgsolve_spmv
   A(A_),
   time_spmv_on(time_spmv_on_),
   use_stream(false)
-  {}
+  {
+    time_comm = 0.0;
+    time_spmv = 0.0;
+  }
 
+  int getGlobalDim() {
+    return n;
+  }
   int getLocalDim() {
     return h_A.row_ptr.extent(0)-1;
   }
@@ -128,6 +134,7 @@ struct cgsolve_spmv
   int getEndRow() {
     return end_row;
   }
+
 
   // -------------------------------------------------------------
   // setup P2P
@@ -261,7 +268,7 @@ struct cgsolve_spmv
 
     num_neighbors_sends = 0;
     max_num_sends = 0;
-    for (int p=0; p<numRanks; p++) {
+    for (int p = 0; p < numRanks; p++) {
       //printf( " > %d: num_sends(%d) = %d, num_recvs(%d) = %d\n",myRank,p,num_sends(p),p,host_num_recvs(p) );
       if (num_sends(p) > 0) {
         host_ptr_sends(num_neighbors_sends+1) = host_ptr_sends(num_neighbors_sends) + num_sends(p);
@@ -380,7 +387,7 @@ struct cgsolve_spmv
   void exchange(XType x) {
 
     // quick return
-    if (numRanks <= 0) return;
+    if (numRanks <= 1) return;
 
     // prepar recv on host/device
     #if defined(CGSOLVE_SPMV_TIMER)
@@ -527,7 +534,7 @@ struct cgsolve_spmv
   void exchange(int nrhs_, MType x) {
 
     // quick return
-    if (numRanks <= 0) return;
+    if (numRanks <= 1) return;
 
     // prepar recv on host/device
     #if defined(CGSOLVE_SPMV_TIMER)
@@ -763,14 +770,14 @@ struct cgsolve_spmv
       fence();
       timer.reset();
     }
-    int nrhs_ = y.extent(1);
-    this->exchange(nrhs_, x);
-    if (time_spmv_on) {
-      fence();
-      time_comm = timer.seconds();
-      timer.reset();
+    if (numRanks > 1) {
+      this->exchange(2, x);
+      if (time_spmv_on) {
+        fence();
+        time_comm = timer.seconds();
+        timer.reset();
+      }
     }
-
     this->local_apply(y, x);
     if (time_spmv_on) {
       fence();
@@ -784,14 +791,14 @@ struct cgsolve_spmv
       fence();
       timer.reset();
     }
-    int nrhs_ = 1;
-    this->exchange(nrhs_, x);
-    if (time_spmv_on) {
-      fence();
-      time_comm = timer.seconds();
-      timer.reset();
+    if (numRanks > 1) {
+      this->exchange(1, x);
+      if (time_spmv_on) {
+        fence();
+        time_comm = timer.seconds();
+        timer.reset();
+      }
     }
-
     auto x0 = getCol<YType> (0, x);
     this->local_apply(y, x0);
     if (time_spmv_on) {
@@ -1023,8 +1030,7 @@ void axpby(ZType z1, XType x1, double beta1, YType y1,
 // =============================================================
 // cg_solve
 template <class VType, class MType, class OP>
-int cg_solve(VType x, OP op, VType b,
-             MType v, MType v_global,
+int cg_solve(VType x_out, OP op, VType b,
              int max_iter, double tolerance, int s,
              bool verbose, bool time_spmv_on, bool time_dot_on, bool time_axpy_on) {
  
@@ -1073,12 +1079,14 @@ int cg_solve(VType x, OP op, VType b,
   auto dot_host = Kokkos::create_mirror_view(dot_result);
 
   // residual vector
-  int nloc = v.extent(0);
-  VType  r("r",  nloc);
-  VType Ap("Ap", nloc);
+  int nloc = x_out.extent(0);
+  MType PRX("PRX",  nloc, 3);
+  auto p = getCol<VType> (0, PRX);
+  auto r = getCol<VType> (1, PRX);
+  auto x = getCol<VType> (2, PRX);
 
   #if 1
-  int n    = v_global.extent(0);
+  int         n = op.getGlobalDim();
   int start_row = op.getStartRow();
   int   end_row = op.getEndRow();
   Kokkos::pair<int, int> local_rows(start_row, end_row);
@@ -1088,11 +1096,6 @@ int cg_solve(VType x, OP op, VType b,
   MType  V("V_global",  nloc, 2*s+1);
   #endif
 
-  Kokkos::pair<int, int> index_P(0,   s+1);
-  Kokkos::pair<int, int> index_R(s+1, 2*s);
-  auto P = Kokkos::subview(V, Kokkos::ALL (), index_P);
-  auto R = Kokkos::subview(V, Kokkos::ALL (), index_R);
-
   //#define KOKKOS_DEBUG_CGSOLVER
   #if defined(KOKKOS_DEBUG_CGSOLVER)
   auto  r_host = Kokkos::create_mirror_view(r);
@@ -1101,21 +1104,52 @@ int cg_solve(VType x, OP op, VType b,
   auto  V_host = Kokkos::create_mirror_view(V);
   #endif
   MType z ("z", nloc, 2);
-
+  // change-of-basis
   MType B_device ("B",  2*s+1, 2*s+1);
+  auto B  = Kokkos::create_mirror_view(B_device);
+  // Gram
+  MType T_device ("T",  2*s+1, 2*s+1);
   MType G_device ("G",  2*s+1, 2*s+1);
+  auto G  = Kokkos::create_mirror_view(G_device);
+  auto T  = Kokkos::create_mirror_view(T_device);
+  // alpha & beta
   MType c_device ("c",  2*s+1, s+1);
   MType t_device ("t",  2*s+1, s+1);
   MType y_device ("y",  2*s+1, s+1);
-  VType w_device ("w",  2*s+1);
-  VType c2_device("c2", 2*s+1);
-  auto B  = Kokkos::create_mirror_view(B_device);
-  auto G  = Kokkos::create_mirror_view(G_device);
   auto c  = Kokkos::create_mirror_view(c_device);
   auto t  = Kokkos::create_mirror_view(t_device);
   auto y  = Kokkos::create_mirror_view(y_device);
+  // alpha & beta
+  MType cp_device ("c2",  2*s+1, s+1);
+  MType tp_device ("t2",  2*s+1, s+1);
+  MType yp_device ("y2",  2*s+1, s+1);
+  auto cp  = Kokkos::create_mirror_view(cp_device);
+  auto tp  = Kokkos::create_mirror_view(tp_device);
+  auto yp  = Kokkos::create_mirror_view(yp_device);
+  auto cp_s = getCol<VType> (s, cp);
+  auto tp_s = getCol<VType> (s, tp);
+  auto yp_s = getCol<VType> (s, yp);
+  //
+  MType CTY ("CTY",  2*s+1, 3);
+  auto c_s = getCol<VType> (0, CTY);
+  auto t_s = getCol<VType> (1, CTY);
+  auto y_s = getCol<VType> (2, CTY);
+  // workspace
+  VType w_device ("w",  2*s+1);
+  VType c2_device("c2", 2*s+1);
   auto w  = Kokkos::create_mirror_view(w_device);
   auto c2 = Kokkos::create_mirror_view(c2_device);
+  // perm to go from V = [p,r,A*p,A*r, ..] to V = [p,A*p, .., r, A*r]
+  int *perm = (int*)malloc((2*s+1)*sizeof(int));
+  int *iperm = (int*)malloc((2*s+1)*sizeof(int));
+  for (int i = 0; i < s; i++) {
+    perm[2*i + 0] = i;
+    perm[2*i + 1] = 1+i + s;
+  }
+  perm[2*s] = s;
+  for (int i = 0; i < 2*s+1; i++) iperm[perm[i]] = i;
+
+  // compute change-of-basis
   Kokkos::deep_copy(B, zero);
   for (int i = 0;   i < s;     i++) B(i+1, i) = one;
   for (int i = s+1; i < 2*s+1; i++) B(i+1, i) = one;
@@ -1149,15 +1183,12 @@ int cg_solve(VType x, OP op, VType b,
   // r = b - A*x
   auto z0  = getCol<VType> (0, z);
   auto z1  = getCol<VType> (1, z);
-  auto v0  = getCol<VType> (0, v);
-  auto v1  = getCol<VType> (1, v);
-  auto v0_global = getCol<VType> (0, v_global);
-  auto v1_global = getCol<VType> (1, v_global);
-  axpby(v0, zero, x, one, x);   // p = x
-  op.apply(Ap, v_global);       // Ap = A*p
-  axpby(r, one, b, -one, Ap);   // r = b-Ap
-
-  local_copy(v0, r);     // p = r
+  auto p0 = getCol<VType> (0, V);
+  auto p0_global = getCol<VType> (0, V_global);
+  axpby(p0, zero, x, one, x);   // p = x
+  op.apply(p0, V_global);       // Ap = A*p
+  axpby(r, one, b, -one, p0);   // r = b-Ap
+  local_copy(p0, r);            // p = r
 
   //printf("Init: x, Ax, b, r\n" );
   //Kokkos::fence();
@@ -1191,24 +1222,26 @@ int cg_solve(VType x, OP op, VType b,
 
     // ==============================================================================
     // Matrix-Powers Kernel
+    // V = [p,A*p, r, A^2*p, A*r, ....]
     if (time_spmv_on) {
       Kokkos::fence();
       timer_spmv.reset();
     }
-    auto r0 = getCol<VType> (0, R);
-    auto p0 = getCol<VType> (0, P);
-    auto p1 = getCol<VType> (1, P);
+    // V(0) = p
+    // V(1) = r
     if (time_spmv_on) {
       Kokkos::fence();
       timer_copy.reset();
     }
-    local_copy(r0, r);
-    local_copy(p0, v0);
+    auto p1 = getCol<VType> (1, V);
+    local_copy(p1, r);
     if (time_spmv_on) {
       Kokkos::fence();
       time_spmv_copy += timer_copy.seconds();
     }
-    op.apply(p1, v_global);
+    // V(2) = A*p
+    auto p2 = getCol<VType> (2, V);
+    op.apply(p2, V_global);
     if (time_spmv_on) {
       Kokkos::fence();
       time_spmv_comm   += op.time_comm;
@@ -1223,30 +1256,23 @@ int cg_solve(VType x, OP op, VType b,
       #endif
     }
     for (int j = 1; j < s; j++) {
-      auto rj0 = getCol<VType> (j-1, R);
-      auto rj1 = getCol<VType> (j+0, R);
+      #if 1
+      Kokkos::pair<int, int> index_0(j,   j+1);
+      auto V0_global = Kokkos::subview(V_global, Kokkos::ALL (), index_0);
+      auto v2 = getCol<VType> (j+2, V);
+      op.apply(v2, V0_global);
 
-      auto pj0 = getCol<VType> (j+0, P);
-      auto pj1 = getCol<VType> (j+1, P);
-
-      #if 0
-      Kokkos::deep_copy(v0, rj0);
-      op.apply(rj1, v_global);
-
-      Kokkos::deep_copy(v0, pj0);
-      op.apply(pj1, v_global);
+      Kokkos::pair<int, int> index_1(j+1, j+2);
+      auto V1_global = Kokkos::subview(V_global, Kokkos::ALL (), index_1);
+      auto v3 = getCol<VType> (j+3, V);
+      op.apply(v3, V1_global);
       #else
-      if (time_spmv_on) {
-        Kokkos::fence();
-        timer_copy.reset();
-      }
-      local_copy(v0, rj0);
-      local_copy(v1, pj0);
-      if (time_spmv_on) {
-        Kokkos::fence();
-        time_spmv_copy += timer_copy.seconds();
-      }
-      op.apply(z, v_global);
+      Kokkos::pair<int, int> index_0(j,   j+2);
+      Kokkos::pair<int, int> index_1(j+2, j+4);
+      auto V0_global = Kokkos::subview(V_global, Kokkos::ALL (), index_0);
+      auto V1        = Kokkos::subview(V,        Kokkos::ALL (), index_1);
+      op.apply(V1, V0_global);
+      #endif
       if (time_spmv_on) {
         time_spmv_comm   += op.time_comm;
         time_spmv_spmv   += op.time_spmv;
@@ -1259,18 +1285,6 @@ int cg_solve(VType x, OP op, VType b,
         time_spmv_wait_recv += op.time_comm_wait_recv;
         #endif
       }
-
-      if (time_spmv_on) {
-        Kokkos::fence();
-        timer_copy.reset();
-      }
-      local_copy(rj1, z0);
-      local_copy(pj1, z1);
-      if (time_spmv_on) {
-        Kokkos::fence();
-        time_spmv_copy += timer_copy.seconds();
-      }
-      #endif
     }
     if (time_spmv_on) {
       Kokkos::fence();
@@ -1292,7 +1306,7 @@ int cg_solve(VType x, OP op, VType b,
     KokkosBlas::
     gemm("T", "N", one,  V,
                          V,
-                   zero, G_device);
+                   zero, T_device);
     Kokkos::fence();
     #endif
     if (time_dot_on) {
@@ -1301,7 +1315,13 @@ int cg_solve(VType x, OP op, VType b,
       timer_dot.reset();
     }
 
-    Kokkos::deep_copy(G, G_device);
+    Kokkos::deep_copy(T, T_device);
+
+    for (int i = 0; i < 2*s+1; i++) {
+      for (int j = 0; j < 2*s+1; j++) {
+        G(perm[i], perm[j]) = T(i, j);
+      }
+    }
     Kokkos::fence();
     if (time_dot_on) {
       time_dot_comm += timer_dot.seconds();
@@ -1318,6 +1338,15 @@ int cg_solve(VType x, OP op, VType b,
     printf("V = [\n" );
     for (int i = 0; i < nloc; i++) {
       for (int j = 0; j < 2*s+1; j++) printf("%.2e ",V_host(i,j));
+      printf("\n");
+    }
+    printf("];\n");
+    printf("perm = [\n" );
+    for (int i = 0; i < 2*s+1; i++) printf( "%d\n",perm[i] );
+    printf("];\n");
+    printf("T = [\n" );
+    for (int i = 0; i < 2*s+1; i++) {
+      for (int j = 0; j < 2*s+1; j++) printf("%.2e ",T(i,j));
       printf("\n");
     }
     printf("];\n");
@@ -1438,26 +1467,34 @@ int cg_solve(VType x, OP op, VType b,
     }
     printf("];\n\n");
     #endif
+    for (int i = 0; i < 2*s+1; i++) {
+      for (int j = 0; j < s+1; j++) {
+        yp(i,j) = y(perm[i], j);
+        cp(i,j) = c(perm[i], j);
+        tp(i,j) = t(perm[i], j);
+      }
+    }
 
     // ==============================================================================
     // update local vectors
-    Kokkos::deep_copy(y_device, y);
-    Kokkos::deep_copy(c_device, c);
-    Kokkos::deep_copy(t_device, t);
     #if defined(CGSOLVE_ENABLE_CUBLAS)
     #if defined(KOKKOS_DEBUG_CGSOLVER)
     Kokkos::deep_copy(x_host, x);
     Kokkos::deep_copy(r_host, r);
     Kokkos::deep_copy(v_host, v);
-    for (int i = 0; i < nloc; i++) printf( " > r(%d) = %.2e, p(%d) = %.2e, x(%d) = %.2e\n",i,r_host(i),i,p_host(i),i,x_host(i) );
+    for (int i = 0; i < nloc; i++) printf( " > r(%d) = %.2e, p(%d) = %.2e, x(%d) = %.2e\n",i,r_host(i),i,v_host(i,0),i,x_host(i) );
     printf("\n");
     #endif
-    auto y1 = getCol<VType> (s, y_device);
-    auto t1 = getCol<VType> (s, t_device);
-    auto c1 = getCol<VType> (s, c_device);
     if (time_axpy_on) {
       timer_axpy.reset();
     }
+    #if 0
+    auto y1 = getCol<VType> (s, yp_device);
+    auto t1 = getCol<VType> (s, tp_device);
+    auto c1 = getCol<VType> (s, cp_device);
+    Kokkos::deep_copy(yp_device, yp);
+    Kokkos::deep_copy(cp_device, cp);
+    Kokkos::deep_copy(tp_device, tp);
     cublasDgemv(cublasHandle, CUBLAS_OP_N,
                 nloc, 2*s+1, &(one),   V.data(), nloc,
                                       y1.data(), 1,
@@ -1469,7 +1506,19 @@ int cg_solve(VType x, OP op, VType b,
     cublasDgemv(cublasHandle, CUBLAS_OP_N,
                 nloc, 2*s+1, &(one),   V.data(), nloc,
                                       c1.data(), 1,
-                             &(zero), v0.data(), 1);
+                             &(zero), p0.data(), 1);
+    #else
+    local_copy(y_s, yp_s);
+    local_copy(c_s, cp_s);
+    local_copy(t_s, tp_s);
+    Kokkos::deep_copy(r, zero);
+    Kokkos::deep_copy(p, zero);
+    cublasDgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+                nloc, 3, 2*s+1, &(one),  V.data(), nloc,
+                                         CTY.data(), 2*s+1,
+                                &(one),  PRX.data(), nloc);
+    local_copy(p0, p);
+    #endif
     if (time_axpy_on) {
       Kokkos::fence();
       time_axpy += timer_axpy.seconds();
@@ -1494,8 +1543,8 @@ int cg_solve(VType x, OP op, VType b,
     printf("];\n");
     Kokkos::deep_copy(x_host, x);
     Kokkos::deep_copy(r_host, r);
-    Kokkos::deep_copy(p_host, p);
-    for (int i = 0; i < nloc; i++) printf( " + r(%d) = %.2e, p(%d) = %.2e, x(%d) = %.2e\n",i,r_host(i),i,p_host(i),i,x_host(i) );
+    Kokkos::deep_copy(v_host, v);
+    for (int i = 0; i < nloc; i++) printf( " + r(%d) = %.2e, p(%d) = %.2e, x(%d) = %.2e\n",i,r_host(i),i,v_host(i,0),i,x_host(i) );
     #endif
     #endif
 
@@ -1507,6 +1556,9 @@ int cg_solve(VType x, OP op, VType b,
 
     num_iters = k;
   }
+  // copy x to output
+  local_copy(x_out, x);
+
   cudaStreamSynchronize(cudaStream);
   Kokkos::fence();
   MPI_Barrier(MPI_COMM_WORLD);
@@ -1515,7 +1567,7 @@ int cg_solve(VType x, OP op, VType b,
   #endif
   time_cg = timer_cg.seconds();
   if (myRank == 0) {
-    std::cout << " > CG Main loop : iter = " << num_iters << " time = " << time_cg << std::endl;
+    std::cout << " > s-step CG Main loop : iter = " << num_iters << " time = " << time_cg << std::endl;
   }
 
   if (time_spmv_on || time_dot_on || time_axpy_on) {
@@ -1601,8 +1653,8 @@ int cg_solve(VType x, OP op, VType b,
     if (myRank == 0) {
       if (time_axpy_on) {
         printf( "\n" );
-        printf( "   time   ( axpy)        = %.2e seconds\n", time_axpy );
-        printf( "   Gflop/s( axpy)        = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
+        printf( "   time   (axpy)         = %.2e seconds\n", time_axpy );
+        printf( "   Gflop/s(axpy)         = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
       }
       printf( "\n  -------------------------------------------\n" );
     }
@@ -1975,12 +2027,8 @@ int main(int argc, char *argv[]) {
     Kokkos::pair<int, int> bounds(start_row, end_row);
     VType b_sub = Kokkos::subview(b, bounds);
 
-    // input vector for SpMV
-    int nrhs = 2;
-    MType p("p", n, nrhs); // global
-    MType p_sub = Kokkos::subview(p, bounds, Kokkos::ALL ()); // local
-
     // setup SpMV
+    int nrhs = 2;
     cgsolve_spmv<VType, HAType, AType, VType, MType, execution_space> op (n, start_row, end_row, h_A, A, time_spmv);
     op.setup(nlocal, nrhs, part_map);
 
@@ -2004,15 +2052,17 @@ int main(int argc, char *argv[]) {
                 << std::endl;
     }
 
+    // for check
+    MType p("p", n, nrhs); // global
+    MType p_sub = Kokkos::subview(p, bounds, Kokkos::ALL ()); // local
     for (int nloop = 0; nloop < loop; nloop++) {
       Kokkos::deep_copy(x_sub, zero);
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
       Kokkos::Timer timer;
-      int num_iters = cg_solve(x_sub, op, b_sub,
-                               p_sub, p,
-                               max_iter, tolerance, s,
-                               verbose, time_spmv, time_dot, time_axpy);
+      int num_iters = cg_solve<VType, MType> (x_sub, op, b_sub,
+                                              max_iter, tolerance, s,
+                                              verbose, time_spmv, time_dot, time_axpy);
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
       double time = timer.seconds();
