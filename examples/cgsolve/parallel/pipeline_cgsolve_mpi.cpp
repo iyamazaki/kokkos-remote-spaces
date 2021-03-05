@@ -356,7 +356,7 @@ struct cgsolve_spmv
   void exchange(XType x) {
 
     // quick return
-    if (numRanks <= 0) return;
+    if (numRanks <= 1) return;
 
     // prepar recv on host/device
     #if defined(CGSOLVE_SPMV_TIMER)
@@ -566,11 +566,13 @@ struct cgsolve_spmv
       fence();
       timer.reset();
     }
-    this->exchange(x);
-    if (time_spmv_on) {
-      fence();
-      time_comm = timer.seconds();
-      timer.reset();
+    if (numRanks > 1) {
+      this->exchange(x);
+      if (time_spmv_on) {
+        fence();
+        time_comm = timer.seconds();
+        timer.reset();
+      }
     }
 
     this->local_apply(y, x);
@@ -900,7 +902,7 @@ int cg_solve(VType x, OP op, VType b,
 
   // beta = r'*r (using Kokkos and non Cuda-aware MPI)
   dot(r, r, beta);
-  if (numRanks > 0) {
+  if (numRanks > 1) {
     Kokkos::fence();
     MPI_Allreduce(MPI_IN_PLACE, &beta, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   }
@@ -1019,14 +1021,14 @@ int cg_solve(VType x, OP op, VType b,
     }
     #endif
     if (idot_option == 1) {
-      if (numRanks > 0) {
+      if (numRanks > 1) {
         // fence before calling MPI
         Kokkos::fence();
         MPI_Iallreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
                        MPI_COMM_WORLD, &request);
       }
     } else if (idot_option == 0) {
-      if (numRanks > 0) {
+      if (numRanks > 1) {
         // fence before calling MPI
         Kokkos::fence();
         MPI_Allreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
@@ -1040,12 +1042,12 @@ int cg_solve(VType x, OP op, VType b,
     dot_host(0) = new_rr;
     dot_host(1) = rAr;
     if (idot_option == 1) {
-      if (numRanks > 0) {
+      if (numRanks > 1) {
         MPI_Iallreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
                        MPI_COMM_WORLD, &request);
       }
     } else {
-      if (numRanks > 0) {
+      if (numRanks > 1) {
         MPI_Allreduce(MPI_IN_PLACE, &(dot_host(0)), 2, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
       }
@@ -1094,7 +1096,7 @@ int cg_solve(VType x, OP op, VType b,
       if (time_idot_on) {
         timer_idot.reset();
       }
-      if (numRanks > 0) {
+      if (numRanks > 1) {
         // wait on non-blocking Iallreduce
         MPI_Wait(&request, &status);
       }
@@ -1128,7 +1130,7 @@ int cg_solve(VType x, OP op, VType b,
         time_idot_wait += timer_idot.seconds();
         timer_idot.reset();
       }
-      if (numRanks > 0) {
+      if (numRanks > 1) {
         MPI_Allreduce(MPI_IN_PLACE, dotResult, 2, MPI_DOUBLE, MPI_SUM,
                       MPI_COMM_WORLD);
       }
@@ -1336,7 +1338,7 @@ int cg_solve(VType x, OP op, VType b,
     }
     if (myRank == 0) {
       if (time_axpy_on) {
-        printf( "   time(axpy)              = %.2e seconds\n", time_axpy );
+        printf( "   time(axpy)             = %.2e seconds\n", time_axpy );
       }
       printf( "\n  -------------------------------------------\n" );
     }
