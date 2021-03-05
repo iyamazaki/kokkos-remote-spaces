@@ -54,10 +54,10 @@
 
 //#define MASK 1099511627776
 #define MASK 268435456
-template <class MemSpace> struct CrsMatrix {
+template <class MemSpace, typename S = double> struct CrsMatrix {
   Kokkos::View<int *, MemSpace> row_ptr;
   Kokkos::View<LOCAL_ORDINAL *, MemSpace> col_idx;
-  Kokkos::View<double *, MemSpace> values;
+  Kokkos::View<S *, MemSpace> values;
 
   int _num_cols;
   KOKKOS_INLINE_FUNCTION
@@ -71,7 +71,7 @@ template <class MemSpace> struct CrsMatrix {
 
   CrsMatrix(Kokkos::View<int *, MemSpace> row_ptr_,
             Kokkos::View<LOCAL_ORDINAL *, MemSpace> col_idx_,
-            Kokkos::View<double *, MemSpace> values_, int num_cols_)
+            Kokkos::View<S *, MemSpace> values_, int num_cols_)
       : row_ptr(row_ptr_), col_idx(col_idx_), values(values_),
         _num_cols(num_cols_) {}
 };
@@ -186,7 +186,8 @@ static void miniFE_get_superblock(int *rows, S *vals, GO *cols,
                    miniFE_b, miniFE_c);
 }
 
-static CrsMatrix<Kokkos::HostSpace> generate_miniFE_matrix(int nx) {
+template <class S = double>
+static CrsMatrix<Kokkos::HostSpace, S> generate_miniFE_matrix(int nx) {
   int miniFE_a = 0;
   int miniFE_b = 0;
   int miniFE_c = 0;
@@ -217,11 +218,11 @@ static CrsMatrix<Kokkos::HostSpace> generate_miniFE_matrix(int nx) {
       "generate_MiniFE_Matrix::rowPtr", endrow - startrow + 1);
   Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
       "generate_MiniFE_Matrix::colInd", (endrow - startrow) * 27);
-  Kokkos::View<double *, Kokkos::HostSpace> values(
+  Kokkos::View<S *, Kokkos::HostSpace> values(
       "generate_MiniFE_Matrix::values", (endrow - startrow) * 27);
 
   int *rows = &rowPtr[0];
-  double *vals = &values[0];
+  S *vals = &values[0];
   LOCAL_ORDINAL *cols = &colInd[0];
 
   int row = 0;
@@ -236,7 +237,7 @@ static CrsMatrix<Kokkos::HostSpace> generate_miniFE_matrix(int nx) {
                         (nx1 - 2) * nx1 * nx1, nx1, 2, 4, 2, 1, miniFE_a,
                         miniFE_b, miniFE_c);
 
-  CrsMatrix<Kokkos::HostSpace> matrix(rowPtr, colInd, values, nx);
+  CrsMatrix<Kokkos::HostSpace, S> matrix(rowPtr, colInd, values, nx);
   return matrix;
 }
 
@@ -257,15 +258,16 @@ static void miniFE_vector_generate_block(S *vec, int nx, S a, S b, int &count,
 template <class S>
 static void miniFE_vector_generate_superblock(S *vec, int nx, S a, S b, S c,
                                               int &count, int start, int end) {
-  miniFE_vector_generate_block(vec, nx, 0.0, 0.0, count, start, end);
-  miniFE_vector_generate_block(vec, nx, a, b, count, start, end);
+  miniFE_vector_generate_block<S>(vec, nx, 0.0, 0.0, count, start, end);
+  miniFE_vector_generate_block<S>(vec, nx, a, b, count, start, end);
   for (int i = 0; i < nx - 3; i++)
-    miniFE_vector_generate_block(vec, nx, a, c, count, start, end);
-  miniFE_vector_generate_block(vec, nx, a, b, count, start, end);
-  miniFE_vector_generate_block(vec, nx, 0.0, 0.0, count, start, end);
+    miniFE_vector_generate_block<S>(vec, nx, a, c, count, start, end);
+  miniFE_vector_generate_block<S>(vec, nx, a, b, count, start, end);
+  miniFE_vector_generate_block<S>(vec, nx, 0.0, 0.0, count, start, end);
 }
 
-Kokkos::View<double *, Kokkos::HostSpace> generate_miniFE_vector(int nx) {
+template <class S = double>
+Kokkos::View<S *, Kokkos::HostSpace> generate_miniFE_vector(int nx) {
 
   int my_rank = 0;
   int num_ranks = 1;
@@ -280,25 +282,26 @@ Kokkos::View<double *, Kokkos::HostSpace> generate_miniFE_vector(int nx) {
     end = numRows;
 
   // Make a multivector X owned entirely by Proc 0.
-  Kokkos::View<double *, Kokkos::HostSpace> X("X_host", numRows);
-  double *vec = X.data();
+  Kokkos::View<S *, Kokkos::HostSpace> X("X_host", numRows);
+  S *vec = X.data();
   int count = 0;
-  miniFE_vector_generate_superblock(vec, nx, 0.0, 0.0, 0.0, count, start, end);
-  miniFE_vector_generate_superblock(vec, nx, 1.0, 5.0 / 12, 8.0 / 12, count,
+  miniFE_vector_generate_superblock<S>(vec, nx, 0.0, 0.0, 0.0, count, start, end);
+  miniFE_vector_generate_superblock<S>(vec, nx, 1.0, 5.0 / 12, 8.0 / 12, count,
                                     start, end);
   for (int i = 0; i < nx - 3; i++)
-    miniFE_vector_generate_superblock(vec, nx, 1.0, 8.0 / 12, 1.0, count, start,
+    miniFE_vector_generate_superblock<S>(vec, nx, 1.0, 8.0 / 12, 1.0, count, start,
                                       end);
-  miniFE_vector_generate_superblock(vec, nx, 1.0, 5.0 / 12, 8.0 / 12, count,
+  miniFE_vector_generate_superblock<S>(vec, nx, 1.0, 5.0 / 12, 8.0 / 12, count,
                                     start, end);
-  miniFE_vector_generate_superblock(vec, nx, 0.0, 0.0, 0.0, count, start, end);
+  miniFE_vector_generate_superblock<S>(vec, nx, 0.0, 0.0, 0.0, count, start, end);
 
   return X;
 }
 
 
 
-static CrsMatrix<Kokkos::HostSpace> generate_Laplace_matrix(int nx, int ny, int nz) {
+template <class S = double>
+static CrsMatrix<Kokkos::HostSpace, S> generate_Laplace_matrix(int nx, int ny, int nz) {
   // global dimension
   int n   = (nz > 1 ? nx * ny * nz : nx * ny);
   int nnz = (nz > 1 ? 7*n : 5*n);
@@ -306,13 +309,13 @@ static CrsMatrix<Kokkos::HostSpace> generate_Laplace_matrix(int nx, int ny, int 
       "generate_MiniFE_Matrix::rowPtr", n + 1);
   Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
       "generate_MiniFE_Matrix::colInd", nnz);
-  Kokkos::View<double *, Kokkos::HostSpace> nzVals(
+  Kokkos::View<S *, Kokkos::HostSpace> nzVals(
       "generate_MiniFE_Matrix::values", nnz);
 
   nnz = 0;
   rowPtr(0) = 0;
   for (int ii = 0; ii < n; ii++) {
-    double v = -1.0;
+    S v = -1.0;
     int i, j, k, jj;
     k = ii / (nx*ny);
     i = (ii - k*nx*ny) / nx;
@@ -364,11 +367,12 @@ static CrsMatrix<Kokkos::HostSpace> generate_Laplace_matrix(int nx, int ny, int 
 
     rowPtr(ii+1) = nnz;
   }
-  CrsMatrix<Kokkos::HostSpace> matrix(rowPtr, colInd, nzVals, n);
+  CrsMatrix<Kokkos::HostSpace, S> matrix(rowPtr, colInd, nzVals, n);
   return matrix;
 }
 
-static void sort_matrix(CrsMatrix<Kokkos::HostSpace> &matrix) {
+template <class S = double>
+static void sort_matrix(CrsMatrix<Kokkos::HostSpace, S> &matrix) {
   // bouble-sort col_idx in each row
   int n = matrix.row_ptr.extent(0)-1;
   for (int i = 0; i < n; i++) {
@@ -377,7 +381,7 @@ static void sort_matrix(CrsMatrix<Kokkos::HostSpace> &matrix) {
         int k1 = k2+1; 
         if (matrix.col_idx[k1] < matrix.col_idx[k2]) {
           int idx = matrix.col_idx[k1];
-          double  val = matrix.values[k1];
+          S val = matrix.values[k1];
 
           matrix.values[k1] = matrix.values[k2];
           matrix.col_idx[k1] = matrix.col_idx[k2];

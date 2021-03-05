@@ -75,6 +75,19 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using memory_space = typename execution_space::memory_space;
 
+#if 0
+ using scalar_type = float;
+
+ #define MPI_SCALAR        MPI_FLOAT
+ #define cusparseXcsrmv    cusparseScsrmv
+ #define cublasXaxpy       cublasSaxpy
+#else
+ using scalar_type = double;
+
+ #define MPI_SCALAR        MPI_DOUBLE
+ #define cusparseXcsrmv    cusparseDcsrmv
+ #define cublasXaxpy       cublasDaxpy
+#endif
 
 // -------------------------------------------------------------
 // SpMV
@@ -85,7 +98,7 @@ struct cgsolve_spmv
   using   host_integer_view_t = Kokkos::View<int *, Kokkos::HostSpace>;
   using mirror_integer_view_t = typename integer_view_t::HostMirror;
 
-  using  buffer_view_t = Kokkos::View<double *>;
+  using  buffer_view_t = Kokkos::View<scalar_type *>;
 
   using team_policy_type  = Kokkos::TeamPolicy<SpaceType>;
   using member_type       = typename team_policy_type::member_type;
@@ -96,7 +109,10 @@ struct cgsolve_spmv
   A(A_),
   time_spmv_on(time_spmv_on_),
   use_stream(false)
-  {}
+  {
+    time_comm = 0.0;
+    time_spmv = 0.0;
+  }
 
   int getLocalDim() {
     return h_A.row_ptr.extent(0)-1;
@@ -117,7 +133,7 @@ struct cgsolve_spmv
 
     // ----------------------------------------------------------
     // find which elements to receive from which process
-    const double zero = 0.0;
+    const scalar_type zero (0.0);
 
     num_recvs = integer_view_t("num_recvs", numRanks);
     host_num_recvs = Kokkos::create_mirror_view(num_recvs);
@@ -355,7 +371,7 @@ struct cgsolve_spmv
   void exchange(XType x) {
 
     // quick return
-    if (numRanks <= 0) return;
+    if (numRanks <= 1) return;
 
     // prepar recv on host/device
     #if defined(CGSOLVE_SPMV_TIMER)
@@ -374,10 +390,10 @@ struct cgsolve_spmv
       int count = host_num_recvs(p); //host_ptr_recvs(q+1)-start;
 
       #if defined(CGSOLVE_GPU_AWARE_MPI)
-      double *buffer = buf_recvs.data();
-      MPI_Irecv(&buffer[start], count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
+      scalar_type *buffer = buf_recvs.data();
+      MPI_Irecv(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
       #else
-      MPI_Irecv(&(host_recvs(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
+      MPI_Irecv(&(host_recvs(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
       #endif
     }
 
@@ -433,10 +449,10 @@ struct cgsolve_spmv
       int count = host_ptr_sends(q+1)-start;
       //printf( " %d: MPI_Isend(count = %d, p = %d)\n",myRank,count,p );
       #if !defined(CGSOLVE_GPU_AWARE_MPI)
-      MPI_Isend(&(host_sends(start)), count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
+      MPI_Isend(&(host_sends(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #else
-      double *buffer = buf_sends.data();
-      MPI_Isend(&buffer[start], count, MPI_DOUBLE, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
+      scalar_type *buffer = buf_sends.data();
+      MPI_Isend(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #endif
     }
 
@@ -504,9 +520,9 @@ struct cgsolve_spmv
      int numCols = n;
      int numRows = h_A.row_ptr.extent(0)-1;
      int nnz = h_A.row_ptr(numRows);
-     double alpha = 1.0;
-     double beta  = 0.0;
-     cusparseDcsrmv(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+     scalar_type alpha (1.0);
+     scalar_type beta  (0.0);
+     cusparseXcsrmv(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                     numRows, numCols, nnz,
                     &alpha, descrA,
                             A.values.data(), A.row_ptr.data(), A.col_idx.data(),
@@ -543,10 +559,10 @@ struct cgsolve_spmv
               const int row_start = A.row_ptr(row);
               const int row_length = A.row_ptr(row + 1) - row_start;
 
-              double y_row = 0.0;
+              scalar_type y_row = 0.0;
               Kokkos::parallel_reduce(
                   Kokkos::ThreadVectorRange(team, row_length),
-                  [=](const int i, double &sum) {
+                  [=](const int i, scalar_type &sum) {
                     int idx = A.col_idx(i + row_start);
                     sum += A.values(i + row_start) * x(idx);
                   },
@@ -565,11 +581,13 @@ struct cgsolve_spmv
       fence();
       timer.reset();
     }
-    this->exchange(x);
-    if (time_spmv_on) {
-      fence();
-      time_comm = timer.seconds();
-      timer.reset();
+    if (numRanks > 1) {
+      this->exchange(x);
+      if (time_spmv_on) {
+        fence();
+        time_comm = timer.seconds();
+        timer.reset();
+      }
     }
 
     this->local_apply(y, x);
@@ -637,20 +655,20 @@ private:
 // -------------------------------------------------------------
 // dot
 template <class XType>
-inline void dot(XType x, double &result) {
+inline void dot(XType x, scalar_type &result) {
   result = 0.0;
   Kokkos::parallel_reduce(
       "DOT", x.extent(0),
-      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += x(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, scalar_type &lsum) { lsum += x(i) * x(i); },
       result);
 }
 
 template <class YType, class XType>
-inline void dot(YType y, XType x, double &result) {
+inline void dot(YType y, XType x, scalar_type &result) {
   result = 0.0;
   Kokkos::parallel_reduce(
       "DOT", y.extent(0),
-      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += y(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, scalar_type &lsum) { lsum += y(i) * x(i); },
       result);
 }
 
@@ -661,7 +679,7 @@ inline void dot(XType x, DType result) {
   Kokkos::deep_copy(result, 0.0);
   Kokkos::parallel_reduce(
       "DOT", x.extent(0),
-      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += x(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, scalar_type &lsum) { lsum += x(i) * x(i); },
       result);
 }
 
@@ -670,7 +688,7 @@ inline void dot(YType y, XType x, DType result) {
   Kokkos::deep_copy(result, 0.0);
   Kokkos::parallel_reduce(
       "DOT", y.extent(0),
-      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += y(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, scalar_type &lsum) { lsum += y(i) * x(i); },
       result);
 }
 
@@ -684,7 +702,7 @@ inline void dot_stream(XType x, DType result, SpaceType space) {
   Kokkos::parallel_reduce(
       "dot_stream(x^T * x)",
       range_policy_t(space, 0, x.extent(0)),
-      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += x(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, scalar_type &lsum) { lsum += x(i) * x(i); },
       result);
 }
 
@@ -696,7 +714,7 @@ inline void dot_stream(YType y, XType x, DType result, SpaceType space) {
   Kokkos::parallel_reduce(
       "dot_stream(y^T * x)",
       range_policy_t(space, 0, x.extent(0)),
-      KOKKOS_LAMBDA(const int &i, double &lsum) { lsum += y(i) * x(i); },
+      KOKKOS_LAMBDA(const int &i, scalar_type &lsum) { lsum += y(i) * x(i); },
       result);
 }
 
@@ -705,7 +723,7 @@ template <class XType, class YType, class DType>
 struct dots_stream {
   using scalar_type  = typename DType::non_const_value_type;
 
-  typedef double value_type[];
+  typedef scalar_type value_type[];
   using size_type = typename XType::size_type;
 
   dots_stream (XType x_, YType y_, DType result_) :
@@ -746,7 +764,7 @@ struct dots_stream {
 // -------------------------------------------------------------
 // axpby
 template <class ZType, class YType, class XType>
-void axpby(ZType z, double alpha, XType x, double beta, YType y) {
+void axpby(ZType z, scalar_type alpha, XType x, scalar_type beta, YType y) {
   int n = z.extent(0);
   Kokkos::parallel_for(
       "AXPBY", n,
@@ -754,8 +772,8 @@ void axpby(ZType z, double alpha, XType x, double beta, YType y) {
 }
 
 template <class ZType, class YType, class XType>
-void axpby(ZType z1, XType x1, double beta1, YType y1,
-           ZType z2, XType x2, double beta2, YType y2) {
+void axpby(ZType z1, XType x1, scalar_type beta1, YType y1,
+           ZType z2, XType x2, scalar_type beta2, YType y2) {
   int n = z1.extent(0);
   Kokkos::parallel_for(
       "AXPBY", n,
@@ -766,8 +784,8 @@ void axpby(ZType z1, XType x1, double beta1, YType y1,
 }
 
 template <class ZType, class YType, class XType, class SpaceType>
-void axpby(ZType z1, XType x1, double beta1, YType y1,
-           ZType z2, XType x2, double beta2, YType y2,
+void axpby(ZType z1, XType x1, scalar_type beta1, YType y1,
+           ZType z2, XType x2, scalar_type beta2, YType y2,
            SpaceType space) {
   using range_policy_t = Kokkos::RangePolicy<SpaceType>;
 
@@ -787,17 +805,18 @@ void axpby(ZType z1, XType x1, double beta1, YType y1,
 template <class VType, class OP>
 int cg_solve(VType x, OP op, VType b,
              VType p, VType p_global,
-             int max_iter, double tolerance,
+             int n, int start_row, int end_row,
+             int max_iter, scalar_type tolerance,
              bool verbose, bool time_spmv_on, bool time_dot_on, bool time_axpy_on) {
 
-  using DView = Kokkos::View<double*>;
+  using DView = Kokkos::View<scalar_type*>;
 
   int myRank, numRanks;
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
   MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
-  const double one = 1.0;
-  const double zero = 0.0;
+  const scalar_type one  (1.0);
+  const scalar_type zero (0.0);
 
   // spmv timer
   Kokkos::Timer timer_cg;
@@ -827,26 +846,32 @@ int cg_solve(VType x, OP op, VType b,
   double time_axpby = 0.0;
   double flop_axpby = 0.0;
 
-  double normr = 0.0;
-  double alpha = 0.0;
-  double beta = 0.0;
-  double old_rr = 0.0;
-  double new_rr = 0.0;
-  double pAp = 0.0;
-  Kokkos::View<double> dot_result("dot_result"); 
+  scalar_type normr = 0.0;
+  scalar_type alpha = 0.0;
+  scalar_type beta = 0.0;
+  scalar_type old_rr = 0.0;
+  scalar_type new_rr = 0.0;
+  scalar_type pAp = 0.0;
+  Kokkos::View<scalar_type> dot_result("dot_result"); 
   auto dot_host = Kokkos::create_mirror_view(dot_result);
 
   // residual vector
-  VType  r("r",  x.extent(0));
-  VType Ap("Ap", x.extent(0));
+  int nloc = x.extent(0);
+  VType  r("r",  nloc);
+  VType Ap("Ap", nloc);
   //#define KOKKOS_DEBUG_CGSOLVER
   #if defined(KOKKOS_DEBUG_CGSOLVER)
   auto  r_host = Kokkos::create_mirror_view(r);
   auto  p_host = Kokkos::create_mirror_view(p);
   auto Ap_host = Kokkos::create_mirror_view(Ap);
   #endif
+  // to compute true-residual with verbose on
+  Kokkos::pair<int, int> bounds(start_row, end_row);
+  VType r_true  ("true_r",  nloc);
+  VType Ax      ("Ax", nloc);
+  VType x_global("true_r",  n);
+  VType x_sub = Kokkos::subview(x_global, bounds);
 
-  int nloc = r.extent(0);
   #if defined(KOKKOS_ENABLE_CUDA)
   cudaStream_t cudaStream[2];
   cublasHandle_t cublasHandle;
@@ -883,7 +908,7 @@ int cg_solve(VType x, OP op, VType b,
   dot(r, dot_result);
   if (numRanks > 0) {
     Kokkos::fence();
-    MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM, MPI_COMM_WORLD);
   }
   Kokkos::deep_copy(dot_host, dot_result);
   beta = *(dot_host.data());
@@ -923,7 +948,7 @@ int cg_solve(VType x, OP op, VType b,
         flop_dot += 2*nloc-1;
         timer_dot.reset();
       }
-      MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_DOUBLE, MPI_SUM,
+      MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                     MPI_COMM_WORLD);
       Kokkos::deep_copy(dot_host, dot_result);
       new_rr = *(dot_host.data());
@@ -993,7 +1018,7 @@ int cg_solve(VType x, OP op, VType b,
       flop_dot += 2*nloc-1;
       timer_dot.reset();
     }
-    MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_DOUBLE, MPI_SUM,
+    MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                   MPI_COMM_WORLD);
     Kokkos::deep_copy(dot_host, dot_result);
     pAp = *(dot_host.data());
@@ -1004,8 +1029,18 @@ int cg_solve(VType x, OP op, VType b,
     // compute alpha
     alpha = new_rr / pAp;
     if (verbose && myRank == 0) {
-      std::cout << "Iteration = " << k << "   Residual = " << normr
-                << " beta = " << beta << ", alpha = " << alpha
+      // r = b - A*x
+      Kokkos::deep_copy(x_sub, x);
+      op.apply(Ax, x_global);           // Ax = A*x
+      axpby(r_true, one, b, -one, Ax);  // r = b-Ax
+
+      // explicit residual norm
+      dot(r_true, r_true, dot_result);
+      Kokkos::deep_copy(dot_host, dot_result);
+      MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
+                    MPI_COMM_WORLD);
+      std::cout << "Iteration = " << k << "   Residual = " << normr << ", " << std::sqrt(*(dot_host.data()))
+                << ", beta = " << beta << ", alpha = " << alpha
                 << std::endl;
     }
 
@@ -1018,9 +1053,9 @@ int cg_solve(VType x, OP op, VType b,
     // x = x + alpha*p
     // r = r - alpha*Ap
     #if defined(CGSOLVE_ENABLE_CUBLAS)
-    double malpha = -alpha;
-    cublasDaxpy(cublasHandle, nloc, &( alpha),  p.data(), 1, x.data(), 1);
-    cublasDaxpy(cublasHandle, nloc, &(malpha), Ap.data(), 1, r.data(), 1);
+    scalar_type malpha = -alpha;
+    cublasXaxpy(cublasHandle, nloc, &( alpha),  p.data(), 1, x.data(), 1);
+    cublasXaxpy(cublasHandle, nloc, &(malpha), Ap.data(), 1, r.data(), 1);
     #else
     axpby(x, one, x,  alpha,  p);
     axpby(r, one, r, -alpha, Ap);
@@ -1118,20 +1153,20 @@ int cg_solve(VType x, OP op, VType b,
       MPI_Allreduce(&time_dot_comm, &max_dot_comm, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
       if (myRank == 0) {
         printf( "\n" );
-        printf( "   Gflop/s(Dot)          = %.2e ~ %.2e\n", min_dot_flop/1e9,max_dot_flop/1e9);
         printf( "   time   (Dot)          = %.2e + %.2e = %.2e seconds\n", time_dot,time_dot_comm,
                                                                            time_dot+time_dot_comm );
         printf( "    + time(Dot)::comp     =  %.2e ~ %.2e seconds\n",min_dot_comp,max_dot_comp );
         printf( "    + time(Dot)::comm     =  %.2e ~ %.2e seconds\n",min_dot_comm,max_dot_comm );
+        printf( "   Gflop/s(Dot)          = %.2e ~ %.2e\n", min_dot_flop/1e9,max_dot_flop/1e9);
       }
     }
     if (myRank == 0) {
       if (time_axpy_on) {
         printf( "\n" );
-        printf( "   Gflop/s( axpy)           = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
-        printf( "   time   ( axpy)           = %.2e seconds\n", time_axpy );
-        printf( "   Gflop/s(axpby)           = %.2e (%.2e flops)\n", flop_axpby/(1e9*time_axpby), flop_axpby );
-        printf( "   time   (axpby)           = %.2e seconds\n", time_axpby );
+        printf( "   time   ( axpy)         = %.2e seconds\n", time_axpy );
+        printf( "   time   (axpby)         = %.2e seconds\n", time_axpby );
+        printf( "   Gflop/s( axpy)         = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
+        printf( "   Gflop/s(axpby)         = %.2e (%.2e flops)\n", flop_axpby/(1e9*time_axpby), flop_axpby );
       }
       printf( "\n  -------------------------------------------\n" );
     }
@@ -1158,20 +1193,20 @@ int main(int argc, char *argv[]) {
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
   MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
-  using  VType = Kokkos::View<double *>;
-  using  AType = CrsMatrix<memory_space>;
-  using HAType = CrsMatrix<host_execution_space>;
+  using  VType = Kokkos::View<scalar_type *>;
+  using  AType = CrsMatrix<memory_space, scalar_type>;
+  using HAType = CrsMatrix<host_execution_space, scalar_type>;
 
-  using VTypeHost = Kokkos::View<double *, Kokkos::HostSpace>;
+  using VTypeHost = Kokkos::View<scalar_type *, Kokkos::HostSpace>;
 
   Kokkos::initialize(argc, argv);
   {
-    int loop         = 1;
+    int loop              = 2;
 
-    int N            = 100;
-    int nx           = 0;
-    int max_iter     = 200;
-    double tolerance = 1e-8;
+    int N                 = 100;
+    int nx                = 0;
+    int max_iter          = 200;
+    scalar_type tolerance = 1e-8;
     std::string matrixFilename {""};
 
     bool metis       = false;
@@ -1249,8 +1284,8 @@ int main(int argc, char *argv[]) {
       std::cout << std::endl;
     }
 
-    const double one = 1.0;
-    const double zero = 0.0;
+    const scalar_type one  (1.0);
+    const scalar_type zero (0.0);
 
     // generate matrix on host
     int *part_map = nullptr;
@@ -1263,15 +1298,15 @@ int main(int argc, char *argv[]) {
     HAType h_G;
     VTypeHost h_b;
     if (matrixFilename != "" || nx > 0) {
-      double  *values;
-      int *col_idx;
-      int *row_ptr;
+      scalar_type *values;
+      int         *col_idx;
+      int         *row_ptr;
       int nnz = 0;
       if (matrixFilename != "") {
-        KokkosKernels::Impl::read_matrix<int, int, double>(
+        KokkosKernels::Impl::read_matrix<int, int, scalar_type>(
           &n, &nnz, &row_ptr, &col_idx, &values, matrixFilename.c_str());
       } else if (nx > 0) {
-        h_G = Impl::generate_Laplace_matrix(nx, nx, nx);
+        h_G = Impl::generate_Laplace_matrix<scalar_type>(nx, nx, nx);
         values = h_G.values.data();
         col_idx = h_G.col_idx.data();
         row_ptr = h_G.row_ptr.data();
@@ -1288,7 +1323,7 @@ int main(int argc, char *argv[]) {
           row_ptr, n+1);
         Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
           col_idx, nnz);
-        Kokkos::View<double *, Kokkos::HostSpace> nzVal(
+        Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
           values, nnz);
         h_A = HAType (rowPtr, colInd, nzVal, n);
       } else {
@@ -1383,7 +1418,7 @@ int main(int argc, char *argv[]) {
             "Matrix::rowPtr", (end_row - start_row)+1);
           Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
             "Matrix::colInd", nnzlocal);
-          Kokkos::View<double *, Kokkos::HostSpace> nzVal(
+          Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
             "MM_Matrix::values", nnzlocal);
 
           nnzlocal = 0;
@@ -1415,7 +1450,7 @@ int main(int argc, char *argv[]) {
             "Matrix::rowPtr", (end_row - start_row)+1);
           Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
             "Matrix::colInd", nnzlocal);
-          Kokkos::View<double *, Kokkos::HostSpace> nzVal(
+          Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
             "MM_Matrix::values", nnzlocal);
 
           nnzlocal = 0;
@@ -1434,9 +1469,9 @@ int main(int argc, char *argv[]) {
       h_b = VTypeHost("b_h", n);
       Kokkos::deep_copy(h_b, one);
     } else {
-      h_A = Impl::generate_miniFE_matrix(N);
+      h_A = Impl::generate_miniFE_matrix<scalar_type>(N);
       // generate rhs
-      h_b = Impl::generate_miniFE_vector(N);
+      h_b = Impl::generate_miniFE_vector<scalar_type>(N);
 
       // global/local dimension
       n = h_b.extent(0);
@@ -1470,7 +1505,7 @@ int main(int argc, char *argv[]) {
     // TODO: move this into op.setup
     Kokkos::View<int *> row_ptr("row_ptr", h_A.row_ptr.extent(0));
     Kokkos::View<int *> col_idx("col_idx", h_A.col_idx.extent(0));
-    Kokkos::View<double  *>  values("values",  h_A.values.extent(0));
+    Kokkos::View<scalar_type *> values("values",  h_A.values.extent(0));
     AType A(row_ptr, col_idx, values, h_A.num_cols());
     Kokkos::deep_copy(A.row_ptr, h_A.row_ptr);
     Kokkos::deep_copy(A.col_idx, h_A.col_idx);
@@ -1537,6 +1572,7 @@ int main(int argc, char *argv[]) {
       Kokkos::Timer timer;
       int num_iters = cg_solve(x_sub, op, b_sub,
                                p_sub, p,
+                               n, start_row, end_row,
                                max_iter, tolerance,
                                verbose, time_spmv, time_dot, time_axpy);
       Kokkos::fence();
@@ -1549,14 +1585,14 @@ int main(int argc, char *argv[]) {
         axpby(r, -one, r, one, b_sub);
         //for (int i = 0; i < r.extent(0); i++) printf( "%d %e %e %e\n",i,b_sub(i),x_sub(i),r(i));
 
-        double rnorm = 0.0;
+        scalar_type rnorm = 0.0;
         dot(r, r, rnorm);
-        MPI_Allreduce(MPI_IN_PLACE, &rnorm, 1, MPI_DOUBLE, MPI_SUM,
+        MPI_Allreduce(MPI_IN_PLACE, &rnorm, 1, MPI_SCALAR, MPI_SUM,
                       MPI_COMM_WORLD);
         rnorm = std::sqrt(rnorm);
-        double bnorm = 0.0;
+        scalar_type bnorm = 0.0;
         dot(b, b, bnorm);
-        MPI_Allreduce(MPI_IN_PLACE, &bnorm, 1, MPI_DOUBLE, MPI_SUM,
+        MPI_Allreduce(MPI_IN_PLACE, &bnorm, 1, MPI_SCALAR, MPI_SUM,
                       MPI_COMM_WORLD);
         bnorm = std::sqrt(bnorm);
         if (myRank == 0) {
