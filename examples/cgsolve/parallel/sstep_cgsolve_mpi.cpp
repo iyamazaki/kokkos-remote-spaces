@@ -57,7 +57,7 @@
 // different options for CGsolver
 #define CGSOLVE_GPU_AWARE_MPI
 #define CGSOLVE_ENABLE_CUBLAS
-#define CGSOLVE_ENABLE_METIS
+//#define CGSOLVE_ENABLE_METIS
 
 #if defined(KOKKOS_ENABLE_CUDA)
 #include <cublas_v2.h>
@@ -78,21 +78,31 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using         memory_space = typename execution_space::memory_space;
 
-#if 0
- using scalar_type = float;
+#if 1
+ using      scalar_type = float;
 
  #define MPI_SCALAR      MPI_FLOAT
  #define cusparseXcsrmv  cusparseScsrmv
+ #define cusparseXcsrmm  cusparseScsrmm
  #define cublasXgemm     cublasSgemm
 
- #define cblas_xdot      cblas_sdot
- #define cblas_xaxpy     cblas_saxpy
- #define cblas_xgemv     cblas_sgemv
+ #if 0
+  using gram_scalar_type = float;
+  #define cblas_xdot      cblas_sdot
+  #define cblas_xaxpy     cblas_saxpy
+  #define cblas_xgemv     cblas_sgemv
+ #else
+  using gram_scalar_type = double;
+  #define cblas_xdot      cblas_ddot
+  #define cblas_xaxpy     cblas_daxpy
+  #define cblas_xgemv     cblas_dgemv
+ #endif
 #else
  using scalar_type = double;
 
  #define MPI_SCALAR      MPI_DOUBLE
  #define cusparseXcsrmv  cusparseDcsrmv
+ #define cusparseXcsrmm  cusparseDcsrmm
  #define cublasXgemm     cublasDgemm
 
  #define cblas_xdot      cblas_ddot
@@ -713,7 +723,7 @@ struct cgsolve_spmv
      int ldx = x.extent(0);
      scalar_type alpha (1.0);
      scalar_type beta  (0.0);
-     cusparseDcsrmm(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+     cusparseXcsrmm(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                     numRows, numRHSs, numCols, nnz,
                     &alpha, descrA,
                             A.values.data(), A.row_ptr.data(), A.col_idx.data(),
@@ -1049,13 +1059,17 @@ void axpby(ZType z1, XType x1, scalar_type beta1, YType y1,
 
 // =============================================================
 // cg_solve
-template <class VType, class MType, class OP>
+template <class VType, class OP>
 int cg_solve(VType x_out, OP op, VType b,
              int max_iter, scalar_type tolerance, int s,
              bool verbose, bool time_spmv_on, bool time_dot_on, bool time_axpy_on) {
  
-  using DView = Kokkos::View<scalar_type*>;
-  using VType_host = typename VType::HostMirror;
+  using GMType = Kokkos::View<gram_scalar_type**>;
+  using GVType = Kokkos::View<gram_scalar_type*>;
+  using  MType = Kokkos::View<scalar_type**>;
+  using GVType_host = typename GVType::HostMirror;
+  using  VType_host = typename  VType::HostMirror;
+  using  DView = Kokkos::View<scalar_type*>;
 
   int myRank, numRanks;
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
@@ -1091,12 +1105,10 @@ int cg_solve(VType x_out, OP op, VType b,
   double time_axpy = 0.0;
   double flop_axpy = 0.0;
 
-  double normr = zero;
-  double alpha = zero;
-  double beta  = zero;
-  double new_rr = 0.0;
-  Kokkos::View<scalar_type> dot_result("dot_result"); 
-  auto dot_host = Kokkos::create_mirror_view(dot_result);
+  gram_scalar_type normr = zero;
+  gram_scalar_type new_rr = 0.0;
+  gram_scalar_type alpha = zero;
+  gram_scalar_type beta  = zero;
 
   // residual vector
   int nloc = x_out.extent(0);
@@ -1115,50 +1127,50 @@ int cg_solve(VType x_out, OP op, VType b,
   #else
   MType  V("V_global",  nloc, 2*s+1);
   #endif
+  auto p0 = getCol<VType> (0, V);
 
   //#define KOKKOS_DEBUG_CGSOLVER
   #if defined(KOKKOS_DEBUG_CGSOLVER)
-  auto  r_host = Kokkos::create_mirror_view(r);
-  auto  v_host = Kokkos::create_mirror_view(v);
-  auto  x_host = Kokkos::create_mirror_view(x);
-  auto  V_host = Kokkos::create_mirror_view(V);
+  auto  r_host  = Kokkos::create_mirror_view(r);
+  auto  x_host  = Kokkos::create_mirror_view(x);
+  auto  V_host  = Kokkos::create_mirror_view(V);
+  auto  p0_host = Kokkos::create_mirror_view(p0);
   #endif
-  MType z ("z", nloc, 2);
   // change-of-basis
-  MType B_device ("B",  2*s+1, 2*s+1);
+  GMType B_device ("B",  2*s+1, 2*s+1);
   auto B  = Kokkos::create_mirror_view(B_device);
   // Gram
-  MType T_device ("T",  2*s+1, 2*s+1);
-  MType G_device ("G",  2*s+1, 2*s+1);
+  GMType T_device ("T",  2*s+1, 2*s+1);
+  GMType G_device ("G",  2*s+1, 2*s+1);
   auto G  = Kokkos::create_mirror_view(G_device);
   auto T  = Kokkos::create_mirror_view(T_device);
   // alpha & beta
-  MType c_device ("c",  2*s+1, s+1);
-  MType t_device ("t",  2*s+1, s+1);
-  MType y_device ("y",  2*s+1, s+1);
+  GMType c_device ("c",  2*s+1, s+1);
+  GMType t_device ("t",  2*s+1, s+1);
+  GMType y_device ("y",  2*s+1, s+1);
   auto c  = Kokkos::create_mirror_view(c_device);
   auto t  = Kokkos::create_mirror_view(t_device);
   auto y  = Kokkos::create_mirror_view(y_device);
   // alpha & beta
-  MType cp_device ("c2",  2*s+1, s+1);
-  MType tp_device ("t2",  2*s+1, s+1);
-  MType yp_device ("y2",  2*s+1, s+1);
+  GMType cp_device ("c2",  2*s+1, s+1);
+  GMType tp_device ("t2",  2*s+1, s+1);
+  GMType yp_device ("y2",  2*s+1, s+1);
   auto cp  = Kokkos::create_mirror_view(cp_device);
   auto tp  = Kokkos::create_mirror_view(tp_device);
   auto yp  = Kokkos::create_mirror_view(yp_device);
-  auto cp_s = getCol<VType> (s, cp);
-  auto tp_s = getCol<VType> (s, tp);
-  auto yp_s = getCol<VType> (s, yp);
+  auto cp_s = getCol<GVType> (s, cp);
+  auto tp_s = getCol<GVType> (s, tp);
+  auto yp_s = getCol<GVType> (s, yp);
   //
   MType CTY ("CTY",  2*s+1, 3);
   auto c_s = getCol<VType> (0, CTY);
   auto t_s = getCol<VType> (1, CTY);
   auto y_s = getCol<VType> (2, CTY);
   // workspace
-  VType w_device ("w",  2*s+1);
-  VType c2_device("c2", 2*s+1);
-  auto w  = Kokkos::create_mirror_view(w_device);
+  GVType w_device ("w",  2*s+1);
+  GVType c2_device("c2", 2*s+1);
   auto c2 = Kokkos::create_mirror_view(c2_device);
+  auto w  = Kokkos::create_mirror_view(w_device);
   // perm to go from V = [p,r,A*p,A*r, ..] to V = [p,A*p, .., r, A*r]
   int *perm = (int*)malloc((2*s+1)*sizeof(int));
   int *iperm = (int*)malloc((2*s+1)*sizeof(int));
@@ -1208,10 +1220,6 @@ int cg_solve(VType x_out, OP op, VType b,
 
   // ==============================================================================
   // r = b - A*x
-  auto z0  = getCol<VType> (0, z);
-  auto z1  = getCol<VType> (1, z);
-  auto p0 = getCol<VType> (0, V);
-  auto p0_global = getCol<VType> (0, V_global);
   axpby(p0, zero, x, one, x);   // p = x
   op.apply(p0, V_global);       // Ap = A*p
   axpby(r, one, b, -one, p0);   // r = b-Ap
@@ -1222,6 +1230,8 @@ int cg_solve(VType x_out, OP op, VType b,
   //for (int i=0; i<b.extent(0); i++) printf(" %e, %e, %e, %e\n",x(i),AAr(i),b(i),r(i));
 
   // beta = r'*r (using Kokkos and non Cuda-aware MPI)
+  Kokkos::View<scalar_type> dot_result("dot_result"); 
+  auto dot_host = Kokkos::create_mirror_view(dot_result);
   dot(r, dot_result);
   if (numRanks > 0) {
     Kokkos::fence();
@@ -1283,7 +1293,7 @@ int cg_solve(VType x_out, OP op, VType b,
       #endif
     }
     for (int j = 1; j < s; j++) {
-      #if 1
+      #if 0
       Kokkos::pair<int, int> index_0(j,   j+1);
       auto V0_global = Kokkos::subview(V_global, Kokkos::ALL (), index_0);
       auto v2 = getCol<VType> (j+2, V);
@@ -1294,8 +1304,9 @@ int cg_solve(VType x_out, OP op, VType b,
       auto v3 = getCol<VType> (j+3, V);
       op.apply(v3, V1_global);
       #else
-      Kokkos::pair<int, int> index_0(j,   j+2);
-      Kokkos::pair<int, int> index_1(j+2, j+4);
+      Kokkos::pair<int, int> index_0(2*(j-1)+1, 2*(j-1)+3);
+      Kokkos::pair<int, int> index_1(2*(j-1)+3, 2*(j-1)+5);
+      //printf( " %d: (%d, %d) -> (%d, %d)\n",j, 2*(j-1)+1,2*(j-1)+2, 2*(j-1)+2,2*(j-1)+4);
       auto V0_global = Kokkos::subview(V_global, Kokkos::ALL (), index_0);
       auto V1        = Kokkos::subview(V,        Kokkos::ALL (), index_1);
       op.apply(V1, V0_global);
@@ -1353,15 +1364,8 @@ int cg_solve(VType x_out, OP op, VType b,
     if (time_dot_on) {
       time_dot_comm += timer_dot.seconds();
     }
-
-    // ==============================================================================
-    // Convergence check (delayed)
-    new_rr = G(s+1, s+1);
-    normr = std::sqrt(new_rr);
-    if (normr <= tolerance) break;
-
     #if defined(KOKKOS_DEBUG_CGSOLVER)
-    Kokkos::deep_copy(V_host, V);
+    /*Kokkos::deep_copy(V_host, V);
     printf("V = [\n" );
     for (int i = 0; i < nloc; i++) {
       for (int j = 0; j < 2*s+1; j++) printf("%.2e ",V_host(i,j));
@@ -1369,7 +1373,7 @@ int cg_solve(VType x_out, OP op, VType b,
     }
     printf("];\n");
     printf("perm = [\n" );
-    for (int i = 0; i < 2*s+1; i++) printf( "%d\n",perm[i] );
+    for (int i = 0; i < 2*s+1; i++) printf( "%d\n",perm[i] );*/
     printf("];\n");
     printf("T = [\n" );
     for (int i = 0; i < 2*s+1; i++) {
@@ -1386,33 +1390,42 @@ int cg_solve(VType x_out, OP op, VType b,
     #endif
 
     // ==============================================================================
+    // Convergence check (delayed), G = V'*V, where V = [p,r,Ap,Ar,...]
+    new_rr = T(1, 1);
+    normr = std::sqrt(new_rr);
+    if (normr <= tolerance) break;
+
+
+    // ==============================================================================
     // Compute "alpha" & "beta" (local redundant compute)
-    auto t0 = getCol<VType_host> (0, t);
-    auto c0 = getCol<VType_host> (0, c);
-    auto y0 = getCol<VType_host> (0, y);
+    auto t0 = getCol<GVType_host> (0, t);
+    auto c0 = getCol<GVType_host> (0, c);
+    auto y0 = getCol<GVType_host> (0, y);
     Kokkos::deep_copy(t0, 0);
     Kokkos::deep_copy(c0, 0);
     Kokkos::deep_copy(y0, 0);
     t0(s+1) = one;
     c0(0) = one;
 
-    scalar_type alpha1 = zero;
-    scalar_type alpha2 = zero;
-    scalar_type  beta1 = zero;
+    gram_scalar_type alpha1 = zero;
+    gram_scalar_type alpha2 = zero;
+    gram_scalar_type  beta1 = zero;
     for (int i = 0; i < s; i++) {
-      auto ti0 = getCol<VType_host> (i+0, t);
-      auto ci0 = getCol<VType_host> (i+0, c);
-      auto yi0 = getCol<VType_host> (i+0, y);
-      auto ti1 = getCol<VType_host> (i+1, t);
-      auto ci1 = getCol<VType_host> (i+1, c);
-      auto yi1 = getCol<VType_host> (i+1, y);
+      auto ti0 = getCol<GVType_host> (i+0, t);
+      auto ci0 = getCol<GVType_host> (i+0, c);
+      auto yi0 = getCol<GVType_host> (i+0, y);
+      auto ti1 = getCol<GVType_host> (i+1, t);
+      auto ci1 = getCol<GVType_host> (i+1, c);
+      auto yi1 = getCol<GVType_host> (i+1, y);
 
+      gram_scalar_type cone  (1.0);
+      gram_scalar_type czero (0.0);
       // c2 = B*c
       cblas_xgemv (CblasColMajor, CblasNoTrans,
             2*s+1, 2*s+1,
-            one,  B.data(), 2*s+1,
-                  ci0.data(), 1,
-            zero, c2.data(),  1);
+            cone,  B.data(), 2*s+1,
+                   ci0.data(), 1,
+            czero, c2.data(),  1);
       #if defined(KOKKOS_DEBUG_CGSOLVER)
       for (int j = 0; j < 2*s+1; j++) printf( " c0(%d) = %.2e, c2(%d) = %.2e\n",j,ci0(j), j,c2(j) );
       printf("\n");
@@ -1422,9 +1435,9 @@ int cg_solve(VType x_out, OP op, VType b,
       if (i == 0) {
         cblas_xgemv (CblasColMajor, CblasNoTrans,
               2*s+1, 2*s+1,
-              one,  G.data(), 2*s+1,
-                    ti0.data(), 1,
-              zero, w.data(),   1);
+              cone,  G.data(), 2*s+1,
+                     ti0.data(), 1,
+              czero, w.data(),   1);
         #if defined(KOKKOS_DEBUG_CGSOLVER)
         for (int j = 0; j < 2*s+1; j++) printf( " t0(%d) = %.2e, w(%d) = %.2e\n",j,ti0(j), j,w(j) );
         printf("\n");
@@ -1436,9 +1449,9 @@ int cg_solve(VType x_out, OP op, VType b,
       // > alpha2 = c'*(G*c2)
       cblas_xgemv (CblasColMajor, CblasNoTrans,
             2*s+1, 2*s+1,
-            one,  G.data(), 2*s+1,
-                  c2.data(), 1,
-            zero, w.data(),  1);
+            cone,  G.data(), 2*s+1,
+                   c2.data(), 1,
+            czero, w.data(),  1);
       alpha2 = cblas_xdot(2*s+1, w.data(), 1, ci0.data(), 1);
       // > alpha = alpha1/alpha2
       alpha = alpha1 / alpha2;
@@ -1458,9 +1471,9 @@ int cg_solve(VType x_out, OP op, VType b,
       // > beta1 = t'(G*t)
       cblas_xgemv (CblasColMajor, CblasTrans,
             2*s+1, 2*s+1,
-            one,  G.data(), 2*s+1,
-                  ti1.data(), 1,
-            zero, w.data(),   1);
+            cone,  G.data(), 2*s+1,
+                   ti1.data(), 1,
+            czero, w.data(),   1);
       beta1 = cblas_xdot(2*s+1, w.data(), 1, ti1.data(), 1);
       beta = beta1 / alpha1;
       #if defined(KOKKOS_DEBUG_CGSOLVER)
@@ -1505,13 +1518,6 @@ int cg_solve(VType x_out, OP op, VType b,
     // ==============================================================================
     // update local vectors
     #if defined(CGSOLVE_ENABLE_CUBLAS)
-    #if defined(KOKKOS_DEBUG_CGSOLVER)
-    Kokkos::deep_copy(x_host, x);
-    Kokkos::deep_copy(r_host, r);
-    Kokkos::deep_copy(v_host, v);
-    for (int i = 0; i < nloc; i++) printf( " > r(%d) = %.2e, p(%d) = %.2e, x(%d) = %.2e\n",i,r_host(i),i,v_host(i,0),i,x_host(i) );
-    printf("\n");
-    #endif
     if (time_axpy_on) {
       timer_axpy.reset();
     }
@@ -1552,13 +1558,6 @@ int cg_solve(VType x_out, OP op, VType b,
       flop_axpy += 3*(4*s)*nloc;
     }
     #if defined(KOKKOS_DEBUG_CGSOLVER)
-    Kokkos::deep_copy(V_host, V);
-    printf(" > V = [\n" );
-    for (int i = 0; i < nloc; i++) {
-      for (int j = 0; j < 2*s+1; j++) printf("%.2e ",V_host(i,j));
-      printf("\n");
-    }
-    printf("];\n");
     Kokkos::deep_copy(w, y1);
     for (int i = 0; i < 2*s+1; i++) printf( " y1(%d) = %.2e\n",i,w(i) );
     printf("];\n");
@@ -1570,13 +1569,21 @@ int cg_solve(VType x_out, OP op, VType b,
     printf("];\n");
     Kokkos::deep_copy(x_host, x);
     Kokkos::deep_copy(r_host, r);
-    Kokkos::deep_copy(v_host, v);
-    for (int i = 0; i < nloc; i++) printf( " + r(%d) = %.2e, p(%d) = %.2e, x(%d) = %.2e\n",i,r_host(i),i,v_host(i,0),i,x_host(i) );
+    Kokkos::deep_copy(p0_host, p0);
+    //for (int i = 0; i < nloc; i++) printf( " + r(%d) = %.2e, p(%d) = %.2e, x(%d) = %.2e\n",i,r_host(i),i,p0_host(i),i,x_host(i) );
+    //Kokkos::deep_copy(V_host, V);
+    //printf(" > V = [\n" );
+    //for (int i = 0; i < nloc; i++) {
+    //  for (int j = 0; j < 2*s+1; j++) printf("%.2e ",V_host(i,j));
+    //  printf("\n");
+    //}
+    //printf("];\n");
     #endif
     #endif
 
     if (verbose && myRank == 0) {
       // r = b - A*x
+      #if 1
       Kokkos::deep_copy(x_sub, x);
       op.apply(Ax, x_global);           // Ax = A*x
       axpby(r_true, one, b, -one, Ax);  // r = b-Ax
@@ -1586,8 +1593,10 @@ int cg_solve(VType x_out, OP op, VType b,
       Kokkos::deep_copy(dot_host, dot_result);
       MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                     MPI_COMM_WORLD);
+      #endif
 
-      std::cout << "Iteration = " << k << "   Residual = " << normr << ", " << std::sqrt(*(dot_host.data()))
+      std::cout << "Iteration = " << k << "   Residual (delayed) = " << normr
+                << ", True Residual (current) = " << std::sqrt(*(dot_host.data()))
                 << ", beta = " << beta << ", alpha = " << alpha
                 << std::endl;
     }
@@ -2086,7 +2095,7 @@ int main(int argc, char *argv[]) {
       }
       std::cout << ", n = " << n << ", nloc = " << nloc
                 << ", nnz/nloc = " << double(nnz)/double(nloc)
-                << ", s = " << s
+                << ", s = " << s << " )"
                 << std::endl;
     }
 
@@ -2098,9 +2107,9 @@ int main(int argc, char *argv[]) {
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
       Kokkos::Timer timer;
-      int num_iters = cg_solve<VType, MType> (x_sub, op, b_sub,
-                                              max_iter, tolerance, s,
-                                              verbose, time_spmv, time_dot, time_axpy);
+      int num_iters = cg_solve<VType> (x_sub, op, b_sub,
+                                       max_iter, tolerance, s,
+                                       verbose, time_spmv, time_dot, time_axpy);
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
       double time = timer.seconds();
