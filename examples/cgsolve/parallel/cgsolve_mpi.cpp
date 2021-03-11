@@ -55,7 +55,7 @@
 // different options for CGsolver
 #define CGSOLVE_GPU_AWARE_MPI
 #define CGSOLVE_ENABLE_CUBLAS
-#define CGSOLVE_ENABLE_METIS
+//#define CGSOLVE_ENABLE_METIS
 
 #if defined(KOKKOS_ENABLE_CUDA)
 #include <cublas_v2.h>
@@ -81,12 +81,16 @@ using memory_space = typename execution_space::memory_space;
  #define MPI_SCALAR        MPI_FLOAT
  #define cusparseXcsrmv    cusparseScsrmv
  #define cublasXaxpy       cublasSaxpy
+ #define cublasXscal       cublasSscal
+ #define cublasXdot        cublasSdot
 #else
  using scalar_type = double;
 
  #define MPI_SCALAR        MPI_DOUBLE
  #define cusparseXcsrmv    cusparseDcsrmv
  #define cublasXaxpy       cublasDaxpy
+ #define cublasXscal       cublasDscal
+ #define cublasXdot        cublasDdot
 #endif
 
 // -------------------------------------------------------------
@@ -861,6 +865,7 @@ int cg_solve(VType x, OP op, VType b,
   VType Ap("Ap", nloc);
   //#define KOKKOS_DEBUG_CGSOLVER
   #if defined(KOKKOS_DEBUG_CGSOLVER)
+  auto  x_host = Kokkos::create_mirror_view(x);
   auto  r_host = Kokkos::create_mirror_view(r);
   auto  p_host = Kokkos::create_mirror_view(p);
   auto Ap_host = Kokkos::create_mirror_view(Ap);
@@ -942,7 +947,11 @@ int cg_solve(VType x, OP op, VType b,
         Kokkos::fence();
         timer_dot.reset();
       }
+      #if defined(CGSOLVE_ENABLE_CUBLAS)
+      cublasXdot(cublasHandle, nloc, r.data(), 1, r.data(), 1, dot_result.data());
+      #else
       dot(r, dot_result);
+      #endif
       if (time_dot_on) {
         time_dot += timer_dot.seconds();
         flop_dot += 2*nloc-1;
@@ -964,9 +973,9 @@ int cg_solve(VType x, OP op, VType b,
         Kokkos::fence();
         timer_axpy.reset();
       }
-      #if 0//defined(CGSOLVE_ENABLE_CUBLAS)
-      cublasDscal(cublasHandle, nloc, &(beta), p.data(), 1);
-      cublasDaxpy(cublasHandle, nloc, &(one),  r.data(), 1, p.data(), 1);
+      #if defined(CGSOLVE_ENABLE_CUBLAS)
+      cublasXscal(cublasHandle, nloc, &(beta), p.data(), 1);
+      cublasXaxpy(cublasHandle, nloc, &(one),  r.data(), 1, p.data(), 1);
       #else
       axpby(p, one, r, beta, p);
       #endif
@@ -986,11 +995,6 @@ int cg_solve(VType x, OP op, VType b,
       timer_spmv.reset();
     }
     op.apply(Ap, p_global);
-    #if defined(KOKKOS_DEBUG_CGSOLVER)
-    Kokkos::deep_copy(Ap_host, Ap);
-    Kokkos::deep_copy( p_host,  p);
-    for (int i = 0; i < nloc; i++) printf( "%d %e %e\n",i,Ap_host(i),p_host(i) );
-    #endif
 
     if (time_spmv_on) {
       Kokkos::fence();
@@ -1012,7 +1016,11 @@ int cg_solve(VType x, OP op, VType b,
       Kokkos::fence();
       timer_dot.reset();
     }
+    #if defined(CGSOLVE_ENABLE_CUBLAS)
+    cublasXdot(cublasHandle, nloc, Ap.data(), 1, p.data(), 1, dot_result.data());
+    #else
     dot(Ap, p, dot_result);
+    #endif
     if (time_dot_on) {
       time_dot += timer_dot.seconds();
       flop_dot += 2*nloc-1;
@@ -1065,6 +1073,14 @@ int cg_solve(VType x, OP op, VType b,
       time_axpy += timer_axpy.seconds();
       flop_axpy += 4*nloc;
     }
+    #if defined(KOKKOS_DEBUG_CGSOLVER)
+    Kokkos::deep_copy(Ap_host, Ap);
+    for (int i = 0; i < nloc; i++) printf( " Ap(%d) = %e\n",i,Ap_host(i) );
+    Kokkos::deep_copy( p_host,  p);
+    Kokkos::deep_copy( x_host,  x);
+    Kokkos::deep_copy( r_host,  r);
+    for (int i = 0; i < nloc; i++) printf( "%d %e %e %e\n",i,p_host(i),x_host(i),r_host(i) );
+    #endif
 
     num_iters = k;
   }
@@ -1165,6 +1181,7 @@ int cg_solve(VType x, OP op, VType b,
         printf( "\n" );
         printf( "   time   ( axpy)         = %.2e seconds\n", time_axpy );
         printf( "   time   (axpby)         = %.2e seconds\n", time_axpby );
+        printf( "   time   (total)         = %.2e seconds\n", time_axpy+time_axpby );
         printf( "   Gflop/s( axpy)         = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
         printf( "   Gflop/s(axpby)         = %.2e (%.2e flops)\n", flop_axpby/(1e9*time_axpby), flop_axpby );
       }
