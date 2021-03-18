@@ -78,7 +78,9 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using         memory_space = typename execution_space::memory_space;
 
-#if 0
+//#define USE_FLOAT
+#define USE_MIXED_PRECISION
+#if defined(USE_FLOAT)
  using      scalar_type = float;
 
  #define MPI_SCALAR      MPI_FLOAT
@@ -86,14 +88,14 @@ using         memory_space = typename execution_space::memory_space;
  #define cusparseXcsrmm  cusparseScsrmm
  #define cublasXgemm     cublasSgemm
 
- #if 0
+ #if !defined(USE_MIXED_PRECISION) // unit-precision
   using gram_scalar_type = float;
 
   #define MPI_DOT_SCALAR      MPI_FLOAT
   #define cblas_xdot          cblas_sdot
   #define cblas_xaxpy         cblas_saxpy
   #define cblas_xgemv         cblas_sgemv
- #else
+ #else // mixed-precision
   using gram_scalar_type = double;
 
   #define MPI_DOT_SCALAR      MPI_DOUBLE
@@ -119,6 +121,8 @@ using         memory_space = typename execution_space::memory_space;
  #define cblas_xdot          cblas_ddot
  #define cblas_xaxpy         cblas_daxpy
  #define cblas_xgemv         cblas_dgemv
+
+ #include "KokkosBlas3_gemm_dd.hpp"
 #endif
 
 // -------------------------------------------------------------
@@ -1437,9 +1441,14 @@ int cg_solve(VType x_out, OP op, VType b,
                      zero, T_device);
       #else
       // directly calling dot-based Gemm since for mixed precision, KokkosBlas::gemm ends up calling ``standard'' implementation
+      #if 0
       KokkosBlas::Impl::
       DotBasedGEMM<execution_space, MType, MType,GMType> gemm(one, V, V, zero, T_device);
       gemm.run(false);
+      #else
+      DotBasedGEMM_dd<execution_space, MType, MType,GMType> gemm(one, V, V, zero, T_device);
+      gemm.run();
+      #endif
       #endif
     }
     Kokkos::fence();
