@@ -122,7 +122,11 @@ using         memory_space = typename execution_space::memory_space;
  #define cblas_xaxpy         cblas_daxpy
  #define cblas_xgemv         cblas_dgemv
 
+ #if defined(USE_MIXED_PRECISION)
  #include "KokkosBlas3_gemm_dd.hpp"
+ #include "qd/dd_real.h"
+ #include "mblas_dd.h"
+ #endif
 #endif
 
 // -------------------------------------------------------------
@@ -1144,6 +1148,7 @@ int cg_solve(VType x_out, OP op, VType b,
   using GVType_host = typename GVType::HostMirror;
   using  VType_host = typename  VType::HostMirror;
   using  DView = Kokkos::View<scalar_type*>;
+  using dot_checks_type = Kokkos::View<int**>;
 
   int myRank, numRanks;
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
@@ -1184,8 +1189,6 @@ int cg_solve(VType x_out, OP op, VType b,
 
   gram_scalar_type normr = zero;
   gram_scalar_type new_rr = 0.0;
-  gram_scalar_type alpha = zero;
-  gram_scalar_type beta  = zero;
 
   // residual vector
   int nloc = x_out.extent(0);
@@ -1230,6 +1233,15 @@ int cg_solve(VType x_out, OP op, VType b,
   GMType G_device ("G",  2*s+1, 2*s+1);
   auto G  = Kokkos::create_mirror_view(G_device);
   auto T  = Kokkos::create_mirror_view(T_device);
+  dot_checks_type dot_checks("dot_checks", 2*s+1, 2*s+1);
+  #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+  int ldg = 2*s+1;
+  int ldb = 2*s+1;
+  dd_real *B_dd = (dd_real*)malloc(ldb * (2*s+1) * sizeof(dd_real));
+  dd_real *G_dd = (dd_real*)malloc(ldg * (2*s+1) * sizeof(dd_real));
+  GMType T_lo_device ("T_lo",  2*s+1, 2*s+1);
+  auto T_lo  = Kokkos::create_mirror_view(T_lo_device);
+  #endif
   // alpha & beta
   GMType c_device ("c",  2*s+1, s+1);
   GMType t_device ("t",  2*s+1, s+1);
@@ -1257,6 +1269,17 @@ int cg_solve(VType x_out, OP op, VType b,
   GVType c2_device("c2", 2*s+1);
   auto c2 = Kokkos::create_mirror_view(c2_device);
   auto w  = Kokkos::create_mirror_view(w_device);
+  #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+  int ldc = 2*s+1;
+  int ldt = 2*s+1;
+  dd_real *c_dd  = (dd_real*)malloc(ldc*(s+1)*sizeof(dd_real));
+  dd_real *t_dd  = (dd_real*)malloc(ldt*(s+1)*sizeof(dd_real));
+  dd_real *w_dd  = (dd_real*)malloc(ldt      *sizeof(dd_real));
+  dd_real *y_dd  = (dd_real*)malloc(ldt*(s+1)*sizeof(dd_real));
+  dd_real *c2_dd = (dd_real*)malloc(ldc      *sizeof(dd_real));
+  dd_real one_dd  = {1.0, 0.0};
+  dd_real zero_dd = {0.0, 0.0};;
+  #endif
   // perm to go from V = [p,r,A*p,A*r, ..] to V = [p,A*p, .., r, A*r]
   int *perm = (int*)malloc((2*s+1)*sizeof(int));
   int *iperm = (int*)malloc((2*s+1)*sizeof(int));
@@ -1269,8 +1292,14 @@ int cg_solve(VType x_out, OP op, VType b,
 
   // compute change-of-basis
   Kokkos::deep_copy(B, zero);
-  for (int i = 0;   i < s;     i++) B(i+1, i) = one;
-  for (int i = s+1; i < 2*s+1; i++) B(i+1, i) = one;
+  for (int i = 0;   i < s;   i++) B(i+1, i) = one;
+  for (int i = s+1; i < 2*s; i++) B(i+1, i) = one;
+  #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+  memset(B_dd, 0, ldb * (2*s+1) * sizeof(dd_real));
+  for (int i = 0;   i < s;   i++) B_dd[i+1 + i*ldb] = one_dd;
+  for (int i = s+1; i < 2*s; i++) B_dd[i+1 + i*ldb] = one_dd;
+  #endif
+
   #if defined(KOKKOS_DEBUG_CGSOLVER)
   printf("B = [\n" );
   for (int i = 0; i < 2*s+1; i++) {
@@ -1330,7 +1359,7 @@ int cg_solve(VType x_out, OP op, VType b,
   tolerance *= normr;
 
   if (verbose && myRank == 0) {
-    std::cout << "Initial Residual = " << normr << std::endl;
+    std::cout << "Initial Residual = " << normr << " Max iters = " << max_iter << " Tol = " << tolerance << std::endl;
   }
 
   // ---------------------------
@@ -1425,7 +1454,7 @@ int cg_solve(VType x_out, OP op, VType b,
     cublasDgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
                 2*s+1, 2*s+1, nloc, &(one),  V.data(), nloc,
                                              V.data(), nloc,
-                                    &(zero), G_device.data(), 2*s+1);
+                                    &(zero), T_device.data(), 2*s+1);
     #else
     if (dot_option == 1) {
       local_mv_copy(V2, V);
@@ -1441,17 +1470,18 @@ int cg_solve(VType x_out, OP op, VType b,
                      zero, T_device);
       #else
       // directly calling dot-based Gemm since for mixed precision, KokkosBlas::gemm ends up calling ``standard'' implementation
-      #if 0
+      #if defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
       KokkosBlas::Impl::
-      DotBasedGEMM<execution_space, MType, MType,GMType> gemm(one, V, V, zero, T_device);
+      DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device);
       gemm.run(false);
       #else
-      DotBasedGEMM_dd<execution_space, MType, MType,GMType> gemm(one, V, V, zero, T_device);
+      DotBasedGEMM_dd<execution_space, MType, MType, GMType, dot_checks_type> gemm(one,  V, V,
+                                                                                   zero, T_device, T_lo_device,
+                                                                                   dot_checks);
       gemm.run();
       #endif
       #endif
     }
-    Kokkos::fence();
     #endif
     if (time_dot_on) {
       time_dot += timer_dot.seconds();
@@ -1463,10 +1493,19 @@ int cg_solve(VType x_out, OP op, VType b,
       MPI_Allreduce(MPI_IN_PLACE, T_device.data(), (2*s+1)*(2*s+1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
     }
     Kokkos::deep_copy(T, T_device);
+    #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+    Kokkos::deep_copy(T_lo, T_lo_device);
+    #endif
 
     for (int i = 0; i < 2*s+1; i++) {
       for (int j = 0; j < 2*s+1; j++) {
+        #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+        G(perm[i], perm[j]) = T(i, j) + T_lo(i, j);;
+        G_dd[perm[i] + perm[j]*ldg].x[0] = T(i, j);
+        G_dd[perm[i] + perm[j]*ldg].x[1] = T_lo(i, j);;
+        #else
         G(perm[i], perm[j]) = T(i, j);
+        #endif
       }
     }
     Kokkos::fence();
@@ -1519,6 +1558,15 @@ int cg_solve(VType x_out, OP op, VType b,
     if (time_axpy_on) {
       timer_seq.reset();
     }
+    #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+    for (int i = 0; i < ldc; i++) {
+      t_dd[i]  = zero_dd;
+      c_dd[i]  = zero_dd;
+      c2_dd[i] = zero_dd;
+    }
+    t_dd[s+1] = one_dd;
+    c_dd[0]   = one_dd;
+    #else
     auto t0 = getCol<GVType_host> (0, t);
     auto c0 = getCol<GVType_host> (0, c);
     auto y0 = getCol<GVType_host> (0, y);
@@ -1527,46 +1575,90 @@ int cg_solve(VType x_out, OP op, VType b,
     Kokkos::deep_copy(y0, zero);
     t0(s+1) = one;
     c0(0) = one;
+    #endif
 
-    gram_scalar_type alpha1 = zero;
-    gram_scalar_type alpha2 = zero;
-    gram_scalar_type  beta1 = zero;
+    #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+    dd_real alpha  = zero_dd;
+    dd_real beta   = zero_dd;
+    dd_real alpha1 = zero_dd;
+    dd_real alpha2 = zero_dd;
+    dd_real  beta1 = zero_dd;
+    #else
+    gram_scalar_type cone  (1.0);
+    gram_scalar_type czero (0.0);
+
+    gram_scalar_type alpha  = czero;
+    gram_scalar_type beta   = czero;
+    gram_scalar_type alpha1 = czero;
+    gram_scalar_type alpha2 = czero;
+    gram_scalar_type  beta1 = czero;
+    #endif
     for (int i = 0; i < s; i++) {
+
+      #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+      dd_real *ti0_dd = &t_dd[(i+0)*ldt];
+      dd_real *ci0_dd = &c_dd[(i+0)*ldc];
+      dd_real *yi0_dd = &y_dd[(i+0)*ldt];
+      dd_real *ti1_dd = &t_dd[(i+1)*ldt];
+      dd_real *ci1_dd = &c_dd[(i+1)*ldc];
+      dd_real *yi1_dd = &y_dd[(i+1)*ldt];
+      #else
       auto ti0 = getCol<GVType_host> (i+0, t);
       auto ci0 = getCol<GVType_host> (i+0, c);
       auto yi0 = getCol<GVType_host> (i+0, y);
       auto ti1 = getCol<GVType_host> (i+1, t);
       auto ci1 = getCol<GVType_host> (i+1, c);
       auto yi1 = getCol<GVType_host> (i+1, y);
+      #endif
 
-      gram_scalar_type cone  (1.0);
-      gram_scalar_type czero (0.0);
       // c2 = B*c
+      #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+      Rgemv ("N",
+             2*s+1, 2*s+1,
+             one_dd,  B_dd, ldb,
+                      ci0_dd, 1,
+             zero_dd, c2_dd,  1);
+      #else
       cblas_xgemv (CblasColMajor, CblasNoTrans,
             2*s+1, 2*s+1,
             cone,  B.data(), 2*s+1,
                    ci0.data(), 1,
             czero, c2.data(),  1);
-      #if defined(KOKKOS_DEBUG_CGSOLVER)
-      for (int j = 0; j < 2*s+1; j++) printf( " c0(%d) = %.2e, c2(%d) = %.2e\n",j,ci0(j), j,c2(j) );
-      printf("\n");
       #endif
+
       // compute alpha
       // > alpha1 = t'(G*t)
       if (i == 0) {
+        #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+        Rgemv ("N",
+               2*s+1, 2*s+1,
+               one_dd,  G_dd,  ldg,
+                        ti0_dd, 1,
+               zero_dd, w_dd,   1);
+        alpha1 = Rdot(2*s+1, w_dd, 1, ti0_dd, 1);
+        #else
         cblas_xgemv (CblasColMajor, CblasNoTrans,
               2*s+1, 2*s+1,
               cone,  G.data(), 2*s+1,
                      ti0.data(), 1,
               czero, w.data(),   1);
-        #if defined(KOKKOS_DEBUG_CGSOLVER)
-        for (int j = 0; j < 2*s+1; j++) printf( " t0(%d) = %.2e, w(%d) = %.2e\n",j,ti0(j), j,w(j) );
-        printf("\n");
-        #endif
         alpha1 = cblas_xdot(2*s+1, w.data(), 1, ti0.data(), 1);
+        #endif
       } else {
         alpha1 = beta1;
       }
+      #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+      // > alpha2 = c'*(G*c2)
+      Rgemv ("N",
+             2*s+1, 2*s+1,
+             one_dd,  G_dd, ldg,
+                      c2_dd, 1,
+             zero_dd, w_dd,  1);
+      alpha2 = Rdot(2*s+1, w_dd, 1, ci0_dd, 1);
+
+      // > alpha = alpha1/alpha2
+      alpha = alpha1 / alpha2;
+      #else
       // > alpha2 = c'*(G*c2)
       cblas_xgemv (CblasColMajor, CblasNoTrans,
             2*s+1, 2*s+1,
@@ -1574,9 +1666,36 @@ int cg_solve(VType x_out, OP op, VType b,
                    c2.data(), 1,
             czero, w.data(),  1);
       alpha2 = cblas_xdot(2*s+1, w.data(), 1, ci0.data(), 1);
+
       // > alpha = alpha1/alpha2
       alpha = alpha1 / alpha2;
+      #endif
 
+      #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+      // update y = y + alpha*c
+      memcpy(yi1_dd, yi0_dd, ldt*sizeof(dd_real));
+      Raxpy (2*s+1, 
+             alpha, ci0_dd, 1,
+                    yi1_dd, 1);
+      // update t = t - alpha*c2
+      memcpy(ti1_dd, ti0_dd, ldt*sizeof(dd_real));
+      Raxpy (2*s+1, 
+            -alpha, c2_dd,  1,
+                    ti1_dd, 1);
+      // > beta1 = t'(G*t)
+      Rgemv ("T",
+             2*s+1, 2*s+1,
+             one_dd,  G_dd, 2*s+1,
+                      ti1_dd, 1,
+             zero_dd, w_dd,   1);
+      beta1 = Rdot(2*s+1, w_dd, 1, ti1_dd, 1);
+      beta = beta1 / alpha1;
+      // update c = t + beta*c
+      memcpy(ci1_dd, ti1_dd, ldt*sizeof(dd_real));
+      Raxpy (2*s+1, 
+             beta, ci0_dd, 1,
+                   ci1_dd, 1);
+      #else
       // update y = y + alpha*c
       Kokkos::deep_copy(yi1, yi0);
       cblas_xaxpy (
@@ -1597,16 +1716,13 @@ int cg_solve(VType x_out, OP op, VType b,
             czero, w.data(),   1);
       beta1 = cblas_xdot(2*s+1, w.data(), 1, ti1.data(), 1);
       beta = beta1 / alpha1;
-      #if defined(KOKKOS_DEBUG_CGSOLVER)
-      for (int j = 0; j < 2*s+1; j++) printf( " y(%d) = %.2e, y(%d) = %.2e\n",j,yi1(j), j,ti1(j) );
-      printf( " alpha = %.2e / %.2e = %.2e, beta = %.2e / %.2e = %.2e\n",alpha1,alpha2,alpha, beta1,alpha1,beta );
-      #endif
       // update c = t + beta*c
       Kokkos::deep_copy(ci1, ti1);
       cblas_xaxpy (
             2*s+1, 
             beta, ci0.data(), 1,
                   ci1.data(), 1);
+      #endif
     }
     #if defined(KOKKOS_DEBUG_CGSOLVER)
     printf("y = [\n" );
@@ -1630,9 +1746,15 @@ int cg_solve(VType x_out, OP op, VType b,
     #endif
     for (int i = 0; i < 2*s+1; i++) {
       for (int j = 0; j < s+1; j++) {
+        #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+        yp(i,j) = y_dd[perm[i] + j*ldt].x[0];
+        cp(i,j) = c_dd[perm[i] + j*ldc].x[0];
+        tp(i,j) = t_dd[perm[i] + j*ldt].x[0];
+        #else
         yp(i,j) = y(perm[i], j);
         cp(i,j) = c(perm[i], j);
         tp(i,j) = t(perm[i], j);
+        #endif
       }
     }
     if (time_axpy_on) {
@@ -1675,9 +1797,9 @@ int cg_solve(VType x_out, OP op, VType b,
                                 &(one),  PRX.data(), nloc);
     //local_copy(p0, p);
     local_mv_copy(V01, PR);
+    Kokkos::fence();
     #endif
     if (time_axpy_on) {
-      Kokkos::fence();
       time_axpy += timer_axpy.seconds();
       flop_axpy += 3*(4*s)*nloc;
     }
@@ -1726,7 +1848,11 @@ int cg_solve(VType x_out, OP op, VType b,
 
       std::cout << "Iteration = " << k << "   Residual (delayed) = " << normr
                 << ", True Residual (current) = " << std::sqrt(*(dot_host.data()))
+                #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+                << ", beta = " << beta.x[0]+beta.x[1] << ", alpha = " << alpha.x[0]+alpha.x[1]
+                #else
                 << ", beta = " << beta << ", alpha = " << alpha
+                #endif
                 << std::endl;
     }
 
@@ -2236,7 +2362,7 @@ int main(int argc, char *argv[]) {
       }
       std::cout << ", n = " << n << ", nloc = " << nloc
                 << ", nnz/nloc = " << double(nnz)/double(nloc)
-                << ", s = " << s << " )"
+                << ", s = " << s << ", dot-option = " << dot_option << " )"
                 << std::endl;
     }
 

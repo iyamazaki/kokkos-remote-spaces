@@ -42,6 +42,8 @@
 //@HEADER
 */
 
+#include "ops_dd.h"
+
 #ifndef KOKKOSBLAS3_GEMM_DD_HPP_
 #define KOKKOSBLAS3_GEMM_DD_HPP_
 
@@ -93,52 +95,69 @@ class ReduceDD {
     sum[1] = 0.0;
   }
 };
-#else
+#else // !USE_REDUCE_DD_FUNCTOR
 namespace ReduceDD {
-   struct dd_add {
-     double val[2];
-  
+   struct dd_sum {
+     double val_hi;
+     double val_lo;
+
      KOKKOS_INLINE_FUNCTION   // Default constructor - Initialize to 0's
-     dd_add() { 
-       val[0] = 0.0;
-       val[1] = 0.0;
+     dd_sum() { 
+       val_hi = 0.0;
+       val_lo = 0.0;
      }
      KOKKOS_INLINE_FUNCTION   // Copy Constructor
-     dd_add(const dd_add & rhs) { 
-       val[0] = rhs.val[0];
-       val[1] = rhs.val[1];
+     dd_sum(const dd_sum & rhs) { 
+       val_hi = rhs.val_hi;
+       val_lo = rhs.val_lo;
      }
      KOKKOS_INLINE_FUNCTION   // add operator
-     dd_add& operator += (const dd_add& src) {
-       val[0] += src.val[0];
+     dd_sum& operator += (const dd_sum& src) {
+       #if 0
+       val_hi += src.val_hi;
+       #else
+       dd_add(    val_hi,     val_lo,
+              src.val_hi, src.val_lo,
+                  val_hi,     val_lo);
+       #endif
+
        return *this;
      } 
      KOKKOS_INLINE_FUNCTION   // volatile add operator 
-     void operator += (const volatile dd_add& src) volatile {
-       val[0] += src.val[0];
+     void operator += (const volatile dd_sum& src) volatile {
+       #if 0
+       val.x[0] += src.val.x[0];
+       #else
+       dd_add(    val_hi,     val_lo,
+              src.val_hi, src.val_lo,
+                  val_hi,     val_lo);
+       #endif
      }
    };
 }
 
 namespace Kokkos { //reduction identity must be defined in Kokkos namespace
    template<>
-   struct reduction_identity< ReduceDD::dd_add > {
-      KOKKOS_FORCEINLINE_FUNCTION static ReduceDD::dd_add sum() {
-         return ReduceDD::dd_add();
+   struct reduction_identity< ReduceDD::dd_sum > {
+      KOKKOS_FORCEINLINE_FUNCTION static ReduceDD::dd_sum sum() {
+         return ReduceDD::dd_sum();
       }
    };
 }
 #endif
 
-struct TagZero{};   // The init tag for beta=0 
-struct TagInit{};   // The init tag for beta!=0 and beta !=1 
-struct TagMult{};   // The multiplication tag for transposed A
-template<class ExecSpace, class AV, class BV, class CV>
+struct TagZero{};      // The init tag for beta=0 
+struct TagInit{};      // The init tag for beta!=0 and beta !=1 
+struct TagInitCheck{}; // The init tag for checks
+struct TagMult{};      // The multiplication tag for transposed A
+template<class ExecSpace, class AV, class BV, class CV, class IV>
 struct DotBasedGEMM_dd{
 
   const AV A;
   const BV B;
-  CV C;
+  CV C_hi;
+  CV C_lo;
+  IV checks;
 
   using scalar_A = typename AV::non_const_value_type;
   using size_A = typename AV::size_type;
@@ -161,7 +180,20 @@ struct DotBasedGEMM_dd{
   size_A chunkSize;      // the local length of each team's share on the dot product  
   
 
-  DotBasedGEMM_dd(const scalar_A& alpha_, const AV& A_, const BV& B_, const scalar_C& beta_, const CV& C_):A(A_),B(B_),C(C_),alpha(alpha_),beta(beta_),numCrows(C.extent(0)),numCcols(C.extent(1)),dotSize(A.extent(0))
+  DotBasedGEMM_dd(const scalar_A& alpha_, const AV& A_,
+                                          const BV& B_,
+                  const scalar_C& beta_,  const CV& C_hi_, const CV& C_lo_,
+                                          const IV& checks_) :
+  A(A_),
+  B(B_),
+  C_hi(C_hi_),
+  C_lo(C_lo_),
+  alpha(alpha_),
+  beta(beta_),
+  checks(checks_),
+  numCrows(C_hi.extent(0)),
+  numCcols(C_hi.extent(1)),
+  dotSize(A.extent(0))
   { }
 
   void run() {
@@ -207,7 +239,13 @@ struct DotBasedGEMM_dd{
       Kokkos::MDRangePolicy<TagInit, ExecSpace, Kokkos::Rank<2>> policyInit({0,0}, {numCrows, numCcols});
       Kokkos::parallel_for("Initialize C for Dot Product Based GEMM", policyInit, *this);
     }
-    
+
+    // Initialize checks
+    {
+      Kokkos::MDRangePolicy<TagInitCheck, ExecSpace, Kokkos::Rank<2>> policyInit({0,0}, {numCrows, numCcols});
+      Kokkos::parallel_for("Initialize checks for Dot Product Based GEMM", policyInit, *this);
+    }
+
     // Multiply alpha*A^TB and add it to beta*C
     Kokkos::TeamPolicy<TagMult, ExecSpace> policyMult(numTeams, Kokkos::AUTO);
     Kokkos::parallel_for("Perform Dot Product Based GEMM", policyMult, *this);
@@ -215,12 +253,17 @@ struct DotBasedGEMM_dd{
 
   KOKKOS_INLINE_FUNCTION
   void operator() (const TagZero&, const size_C &rowId, const size_C &colId ) const {
-    C(rowId, colId) = CVT::zero(); 
+    C_hi(rowId, colId) = CVT::zero(); 
   }
 
   KOKKOS_INLINE_FUNCTION
   void operator() (const TagInit&, const size_C &rowId, const size_C &colId ) const {
-    C(rowId, colId) = beta * C(rowId, colId);
+    C_hi(rowId, colId) = beta * C_hi(rowId, colId);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (const TagInitCheck&, const size_C &rowId, const size_C &colId ) const {
+    checks(rowId, colId) = 0;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -233,8 +276,8 @@ struct DotBasedGEMM_dd{
     const size_C colId = i % numCcols;
     
     const size_A baseInd = chunkSize*localRank; 
-    #if 1
 
+    #if 1
     // inputs vectors 
     const size_A endInd = (baseInd+chunkSize > dotSize ? dotSize : baseInd+chunkSize); 
     Kokkos::pair<int, int> bounds(baseInd, endInd);
@@ -259,17 +302,54 @@ struct DotBasedGEMM_dd{
       Kokkos::atomic_add(&C(rowId, colId), local_result);
       });
     #else
-    ReduceDD::dd_add result;
-    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(teamMember, chunkSize), [&](const size_A k, ReduceDD::dd_add &update ) {
+    // ----------------------------------------------------------------------------
+    // paralllel-reduce among threads to form local accumulation into "result"
+    // Question: does only one thread execute dd_mad at a time, or just write to result?
+    ReduceDD::dd_sum result;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(teamMember, chunkSize), [&](const size_A k, ReduceDD::dd_sum &update ) {
         if(baseInd + k < dotSize) {
-          update.val[0] += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
+          #if 0
+          update.val.x[0] += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
+          #else
+          double a = alpha * A(baseInd+k, rowId);
+          double b =         B(baseInd+k, colId);
+          dd_mad(update.val_hi, update.val_lo,
+                 a, b);
+          #endif
         }
-     }, Kokkos::Sum<ReduceDD::dd_add>(result) );
+     }, Kokkos::Sum<ReduceDD::dd_sum>(result) );
+    teamMember.team_barrier ();
 
-    Kokkos::single(Kokkos::PerTeam(teamMember), [&] () { 
-      double local_result = result.val[0] + result.val[1];
+    //const int team_rank = teamMember.team_rank ();
+    //if (rowId == 0 && colId == 0 && team_rank == 0) printf( " %d %e, %e\n",globalRank,result.val_hi,result.val_lo );
+
+    // ----------------------------------------------------------------------------
+    // parallel-reduce of local "result" among teams
+    Kokkos::single(Kokkos::PerTeam(teamMember), [&] () {
+      #if 0
+      double local_result = result.val.x[0] + result.val.x[1];
       Kokkos::atomic_add(&C(rowId, colId), local_result);
+      #else
+      const int free_val = 0;
+      const int busy_val = 1;
+      // busy wait
+      while (free_val != Kokkos::atomic_compare_exchange<int>(&checks(rowId, colId), free_val, busy_val)) {}
+
+      // atomic-add
+      #if 0
+      double local_result = result.val_hi + result.val_lo;
+      Kokkos::atomic_add(&C(rowId, colId), local_result);
+      #else
+      dd_add(result.val_hi, result.val_lo,
+             C_hi(rowId, colId), C_lo(rowId, colId),
+             C_hi(rowId, colId), C_lo(rowId, colId));
+      #endif
+
+      // free atomic
+      Kokkos::Impl::atomic_store<int>(&checks(rowId, colId), free_val);
+      #endif
       });
+    //if (rowId == 0 && colId == 0 && team_rank == 0) printf( " %d -> %e\n",globalRank,C(rowId,colId) );
     #endif
     #else
     scalar_C result = CVT::zero();
