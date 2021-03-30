@@ -953,12 +953,15 @@ int cg_solve(VType x, OP op, VType b,
       dot(r, dot_result);
       #endif
       if (time_dot_on) {
+        Kokkos::fence();
         time_dot += timer_dot.seconds();
         flop_dot += 2*nloc-1;
         timer_dot.reset();
       }
-      MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
-                    MPI_COMM_WORLD);
+      if (numRanks > 1) {
+        MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
+                      MPI_COMM_WORLD);
+      }
       Kokkos::deep_copy(dot_host, dot_result);
       new_rr = *(dot_host.data());
       if (time_dot_on) {
@@ -973,7 +976,7 @@ int cg_solve(VType x, OP op, VType b,
         Kokkos::fence();
         timer_axpy.reset();
       }
-      #if defined(CGSOLVE_ENABLE_CUBLAS)
+      #if 0//defined(CGSOLVE_ENABLE_CUBLAS)
       cublasXscal(cublasHandle, nloc, &(beta), p.data(), 1);
       cublasXaxpy(cublasHandle, nloc, &(one),  r.data(), 1, p.data(), 1);
       #else
@@ -1026,8 +1029,10 @@ int cg_solve(VType x, OP op, VType b,
       flop_dot += 2*nloc-1;
       timer_dot.reset();
     }
-    MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
-                  MPI_COMM_WORLD);
+    if (numRanks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
+                    MPI_COMM_WORLD);
+    }
     Kokkos::deep_copy(dot_host, dot_result);
     pAp = *(dot_host.data());
     if (time_dot_on) {
@@ -1184,6 +1189,7 @@ int cg_solve(VType x, OP op, VType b,
         printf( "   time   (total)         = %.2e seconds\n", time_axpy+time_axpby );
         printf( "   Gflop/s( axpy)         = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
         printf( "   Gflop/s(axpby)         = %.2e (%.2e flops)\n", flop_axpby/(1e9*time_axpby), flop_axpby );
+        printf( "   Gflop/s(total)         = %.2e (%.2e flops)\n", (flop_axpy+flop_axpby)/(1e9*(time_axpy+time_axpby)), flop_axpy+flop_axpby );
       }
       printf( "\n  -------------------------------------------\n" );
     }
