@@ -57,7 +57,7 @@
 // different options for CGsolver
 #define CGSOLVE_GPU_AWARE_MPI
 #define CGSOLVE_ENABLE_CUBLAS
-//#define CGSOLVE_ENABLE_METIS
+#define CGSOLVE_ENABLE_METIS
 
 #if defined(KOKKOS_ENABLE_CUDA)
 #include <cublas_v2.h>
@@ -477,6 +477,22 @@ struct cgsolve_spmv
     }
     #endif
     int num_neighbors_sends = ngb_sends.extent(0);
+    #if 1
+    using range_policy_t = Kokkos::RangePolicy<SpaceType>;
+    range_policy_t send_policy (space, 0, max_num_sends);
+    Kokkos::parallel_for(
+      "pack-for-send", send_policy,
+      KOKKOS_LAMBDA(const int & k) {
+        for(int q = 0; q < num_neighbors_sends; q++) {
+            int p = ngb_sends(q);
+            int start = ptr_sends(q);
+            int count = ptr_sends(q+1)-start;
+            if(k < count) {
+              buf_sends(start+k) = x(idx_sends(start+k));
+            }
+        }
+      });
+    #else
     team_policy_type send_policy (space, max_num_sends, Kokkos::AUTO);
     Kokkos::parallel_for(
       "pack-for-send", send_policy,
@@ -492,6 +508,7 @@ struct cgsolve_spmv
             }
           });
       });
+    #endif
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       fence();
@@ -550,6 +567,22 @@ struct cgsolve_spmv
     #endif
 
     // unpack on device
+    #if 1
+    using range_policy_t = Kokkos::RangePolicy<SpaceType>;
+    range_policy_t recv_policy (space, 0, max_num_recvs);
+    Kokkos::parallel_for(
+      "unpack-for-recv", recv_policy,
+      KOKKOS_LAMBDA(const int & k) {
+        for(int q = 0; q < num_neighbors_recvs; q++) {
+            int p = ngb_recvs(q);
+            int start = ptr_recvs(q);
+            int count = num_recvs(p); //ptr_recvs(q+1)-start;
+            if (k < count) {
+              x(idx_recvs(start+k)) = buf_recvs(start+k);
+            }
+        }
+      });
+    #else
     team_policy_type recv_policy (space, max_num_recvs, Kokkos::AUTO);
     Kokkos::parallel_for(
       "unpack-for-recv", recv_policy,
@@ -560,13 +593,12 @@ struct cgsolve_spmv
             int p = ngb_recvs(q);
             int start = ptr_recvs(q);
             int count = num_recvs(p); //ptr_recvs(q+1)-start;
-            //int id = (k < count ? start+k : start+count-1);
-            //x(idx_recvs(id)) = buf_recvs(id);
             if (k < count) {
               x(idx_recvs(start+k)) = buf_recvs(start+k);
             }
           });
       });
+    #endif
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       fence();
@@ -624,6 +656,23 @@ struct cgsolve_spmv
     }
     #endif
     int num_neighbors_sends = ngb_sends.extent(0);
+    #if 1
+    using range_policy_t = Kokkos::RangePolicy<SpaceType>;
+    range_policy_t send_policy (space, 0, max_num_sends);
+    Kokkos::parallel_for(
+      "pack-for-send", send_policy,
+      KOKKOS_LAMBDA(const int & k) {
+        for(int q = 0; q < num_neighbors_sends; q++) {
+            int start = ptr_sends(q);
+            int count = ptr_sends(q+1)-start;
+            if(k < count) {
+              for (int j = 0; j < nrhs_; j++) {
+                buf_sends((k+start)*nrhs_+j) = x(idx_sends(start+k), j);
+              }
+            }
+        }
+      });
+    #else
     team_policy_type send_policy (space, max_num_sends, Kokkos::AUTO);
     Kokkos::parallel_for(
       "pack-for-send", send_policy,
@@ -641,6 +690,7 @@ struct cgsolve_spmv
             }
           });
       });
+    #endif
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       fence();
@@ -699,6 +749,24 @@ struct cgsolve_spmv
     #endif
 
     // unpack on device
+    #if 1
+    using range_policy_t = Kokkos::RangePolicy<SpaceType>;
+    range_policy_t recv_policy (space, 0, max_num_recvs);
+    Kokkos::parallel_for(
+      "unpack-for-recv", recv_policy,
+      KOKKOS_LAMBDA(const int & k) {
+        for(int q = 0; q < num_neighbors_recvs; q++) {
+            int p = ngb_recvs(q);
+            int start = ptr_recvs(q);
+            int count = num_recvs(p); //ptr_recvs(q+1)-start;
+            if (k < count) {
+              for (int j = 0; j < nrhs_; j++) {
+                x(idx_recvs(start+k),j) = buf_recvs((start+k)*nrhs_+j);
+              }
+            }
+        }
+      });
+    #else
     team_policy_type recv_policy (space, max_num_recvs, Kokkos::AUTO);
     Kokkos::parallel_for(
       "unpack-for-recv", recv_policy,
@@ -716,6 +784,7 @@ struct cgsolve_spmv
             }
           });
       });
+    #endif
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       fence();
@@ -2459,9 +2528,11 @@ int main(int argc, char *argv[]) {
         if (myRank == 0) {
           printf( "\n ====================================" );
           printf( "\n rnorm = %e / %e = %e\n",rnorm,bnorm,rnorm/bnorm );
-          printf( " num_iters = %i, time = %.2lf\n\n", num_iters, time);
         }
       } // end of check
+      if (myRank == 0) {
+        printf( " num_iters = %i, time = %.2lf\n\n", num_iters, time);
+      }
     } // end of loop
   }
   Kokkos::finalize();

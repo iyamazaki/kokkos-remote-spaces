@@ -409,6 +409,22 @@ struct cgsolve_spmv
     }
     #endif
     int num_neighbors_sends = ngb_sends.extent(0);
+    #if 1
+    using range_policy_t = Kokkos::RangePolicy<SpaceType>;
+    range_policy_t send_policy (space, 0, max_num_sends);
+    Kokkos::parallel_for(
+      "pack-for-send", send_policy,
+      KOKKOS_LAMBDA(const int & k) {
+        for (int q = 0; q < num_neighbors_sends; q++ ) {
+            int p = ngb_sends(q);
+            int start = ptr_sends(q);
+            int count = ptr_sends(q+1)-start;
+            if(k < count) {
+              buf_sends(start+k) = x(idx_sends(start+k));
+            }
+        }
+      });
+    #else
     team_policy_type send_policy (space, max_num_sends, Kokkos::AUTO);
     Kokkos::parallel_for(
       "pack-for-send", send_policy,
@@ -424,6 +440,7 @@ struct cgsolve_spmv
             }
           });
       });
+    #endif
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       fence();
@@ -482,6 +499,22 @@ struct cgsolve_spmv
     #endif
 
     // unpack on device
+    #if 1
+    using range_policy_t = Kokkos::RangePolicy<SpaceType>;
+    range_policy_t recv_policy (space, 0, max_num_recvs);
+    Kokkos::parallel_for(
+      "unpack-for-recv", recv_policy,
+      KOKKOS_LAMBDA(const int & k) {
+        for(int q = 0; q < num_neighbors_recvs; q++) {
+            int p = ngb_recvs(q);
+            int start = ptr_recvs(q);
+            int count = num_recvs(p); //ptr_recvs(q+1)-start;
+            if (k < count) {
+              x(idx_recvs(start+k)) = buf_recvs(start+k);
+            }
+        }
+      });
+    #else
     team_policy_type recv_policy (space, max_num_recvs, Kokkos::AUTO);
     Kokkos::parallel_for(
       "unpack-for-recv", recv_policy,
@@ -499,6 +532,7 @@ struct cgsolve_spmv
             }
           });
       });
+    #endif
     #if defined(CGSOLVE_SPMV_TIMER)
     if (time_spmv_on) {
       fence();
@@ -1232,7 +1266,9 @@ int main(int argc, char *argv[]) {
     scalar_type tolerance = 1e-8;
     std::string matrixFilename {""};
 
+    #if defined(CGSOLVE_ENABLE_METIS)
     bool metis       = false;
+    #endif
     bool sort_matrix = false;
     bool verbose     = false;
     bool time_dot    = false;
@@ -1621,9 +1657,11 @@ int main(int argc, char *argv[]) {
         if (myRank == 0) {
           printf( "\n ====================================" );
           printf( "\n rnorm = %e / %e = %e\n",rnorm,bnorm,rnorm/bnorm );
-          printf( " num_iters = %i, time = %.2lf\n\n", num_iters, time);
         }
       } // end of check
+      if (myRank == 0) {
+        printf( " num_iters = %i, time = %.2lf\n\n", num_iters, time);
+      }
     } // end of loop
   }
   Kokkos::finalize();
