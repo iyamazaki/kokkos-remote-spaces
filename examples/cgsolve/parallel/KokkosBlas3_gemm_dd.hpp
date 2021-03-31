@@ -54,48 +54,7 @@
 // performed on very long vectors, so, each dot product is distributed among
 // numDivPerDot teams.     
 
-#ifdef USE_REDUCE_DD_FUNCTOR
-class ReduceDD {
-  public:
-  // the reduction result is an double-double, i.e., array of double
-  typedef double value_type[];
-  typedef Kokkos::View<double*>::size_type size_type;
-
-  // Tell Kokkos the result array's number of entries.
-  // This must be a public value in the functor.
-  size_type value_count;
-   
-  // input is two double vectoors 
-  Kokkos::View<double*> X_;
-  Kokkos::View<double*> Y_;
-
-  // Be sure to set value_count in the constructor.
-  ReduceDD (const Kokkos::View<double*>& X,
-            const Kokkos::View<double*>& Y) :
-        value_count (2), // output is DD
-        X_ (X),
-        Y_ (Y)
-  {}
-
-  KOKKOS_INLINE_FUNCTION
-  void operator() (const size_type i, value_type sum) const {
-    sum[0] += X_(i) * Y_(i);
-  }
-
-  KOKKOS_INLINE_FUNCTION
-  void join (      volatile value_type dst,
-             const volatile value_type src) const {
-      dst[0] += src[0];
-      dst[1] += src[1];
-  }
-
-  KOKKOS_INLINE_FUNCTION
-  void init (value_type sum) const {
-    sum[0] = 0.0;
-    sum[1] = 0.0;
-  }
-};
-#else // !USE_REDUCE_DD_FUNCTOR
+/* ------------------------------------------------------------------------------------ */
 namespace ReduceDD {
    struct dd_sum {
      double val_hi;
@@ -144,7 +103,7 @@ namespace Kokkos { //reduction identity must be defined in Kokkos namespace
       }
    };
 }
-#endif
+/* ------------------------------------------------------------------------------------ */
 
 struct TagZero{};      // The init tag for beta=0 
 struct TagInit{};      // The init tag for beta!=0 and beta !=1 
@@ -208,6 +167,11 @@ struct DotBasedGEMM_dd{
     if(appxNumTeams > 1024)
       appxNumTeams = 1024;
 
+    #if 0
+    // debug: forcing one team per C(i,j), so no reduction among teams at the end
+    numTeams = ndots;
+    numDivPerDot = 1;
+    #else
     // If there are more dot products than the number of teams,
     // then set the number of teams to be number of dot products
     // and each team will perform only one dot product.
@@ -224,6 +188,7 @@ struct DotBasedGEMM_dd{
       numDivPerDot = appxNumTeams / ndots;
       numTeams = ndots * numDivPerDot;
     }
+    #endif
 
     // Determine the local length for the dot product
     chunkSize = dotSize / numDivPerDot;
@@ -254,11 +219,13 @@ struct DotBasedGEMM_dd{
   KOKKOS_INLINE_FUNCTION
   void operator() (const TagZero&, const size_C &rowId, const size_C &colId ) const {
     C_hi(rowId, colId) = CVT::zero(); 
+    C_lo(rowId, colId) = CVT::zero();
   }
 
   KOKKOS_INLINE_FUNCTION
   void operator() (const TagInit&, const size_C &rowId, const size_C &colId ) const {
     C_hi(rowId, colId) = beta * C_hi(rowId, colId);
+    C_lo(rowId, colId) = beta * C_lo(rowId, colId);
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -288,23 +255,21 @@ struct DotBasedGEMM_dd{
     auto lA = Kokkos::View<double*>(lAview.data(), endInd-baseInd);
     auto lB = Kokkos::View<double*>(lBview.data(), endInd-baseInd);
 
-    #ifdef USE_REDUCE_DD_FUNCTOR
-    // output in DD
-    //scalar_C result[2];
-    //result[0] = CVT::zero();
-    //result[1] = CVT::zero();
-    auto result = Kokkos::View<double*>("result", 2);
-    ReduceDD reducer(lA, lB);
-    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(teamMember, chunkSize), reducer, result);
-
-    Kokkos::single(Kokkos::PerTeam(teamMember), [&] () { 
-      double local_result = result[0] + result[1];
-      Kokkos::atomic_add(&C(rowId, colId), local_result);
-      });
-    #else
     // ----------------------------------------------------------------------------
     // paralllel-reduce among threads to form local accumulation into "result"
     // Question: does only one thread execute dd_mad at a time, or just write to result?
+    #if 0
+    // debug: just doing reduction with double
+    double result_d = 0.0;
+    Kokkos::parallel_reduce( Kokkos::TeamThreadRange(teamMember, chunkSize), [&]( const size_A k, double &update ) {
+	if(baseInd + k < dotSize)
+	  update += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
+      }, result_d );
+    teamMember.team_barrier ();
+    ReduceDD::dd_sum result;
+    result.val_hi = result_d;
+    result.val_lo = 0.0;
+    #else
     ReduceDD::dd_sum result;
     Kokkos::parallel_reduce(Kokkos::TeamThreadRange(teamMember, chunkSize), [&](const size_A k, ReduceDD::dd_sum &update ) {
         if(baseInd + k < dotSize) {
@@ -319,6 +284,7 @@ struct DotBasedGEMM_dd{
         }
      }, Kokkos::Sum<ReduceDD::dd_sum>(result) );
     teamMember.team_barrier ();
+    #endif
 
     //const int team_rank = teamMember.team_rank ();
     //if (rowId == 0 && colId == 0 && team_rank == 0) printf( " %d %e, %e\n",globalRank,result.val_hi,result.val_lo );
@@ -350,7 +316,6 @@ struct DotBasedGEMM_dd{
       #endif
       });
     //if (rowId == 0 && colId == 0 && team_rank == 0) printf( " %d -> %e\n",globalRank,C(rowId,colId) );
-    #endif
     #else
     scalar_C result = CVT::zero();
     Kokkos::parallel_reduce( Kokkos::TeamThreadRange(teamMember, chunkSize), [&]( const size_A k, scalar_C &update ) {
