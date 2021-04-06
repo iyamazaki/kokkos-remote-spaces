@@ -78,7 +78,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using         memory_space = typename execution_space::memory_space;
 
-//#define USE_FLOAT
+#define USE_FLOAT
 #define USE_MIXED_PRECISION
 #if defined(USE_FLOAT)
  using      scalar_type = float;
@@ -1312,16 +1312,18 @@ int cg_solve(VType x_out, OP op, VType b,
   auto T  = Kokkos::create_mirror_view(T_device);
   dot_checks_type dot_checks("dot_checks", 2*s+1, 2*s+1);
   // alpha & beta
-  GMType c_device ("c",  2*s+1, s+1);
-  GMType t_device ("t",  2*s+1, s+1);
-  GMType y_device ("y",  2*s+1, s+1);
+  int ldc = 2*s+1;
+  int ldt = 2*s+1;
+  GMType c_device ("c",  ldc, s+1);
+  GMType t_device ("t",  ldt, s+1);
+  GMType y_device ("y",  ldt, s+1);
   auto c  = Kokkos::create_mirror_view(c_device);
   auto t  = Kokkos::create_mirror_view(t_device);
   auto y  = Kokkos::create_mirror_view(y_device);
   // alpha & beta
-  GMType cp_device ("c2",  2*s+1, s+1);
-  GMType tp_device ("t2",  2*s+1, s+1);
-  GMType yp_device ("y2",  2*s+1, s+1);
+  GMType cp_device ("c2",  ldc, s+1);
+  GMType tp_device ("t2",  ldt, s+1);
+  GMType yp_device ("y2",  ldt, s+1);
   auto cp  = Kokkos::create_mirror_view(cp_device);
   auto tp  = Kokkos::create_mirror_view(tp_device);
   auto yp  = Kokkos::create_mirror_view(yp_device);
@@ -1329,18 +1331,16 @@ int cg_solve(VType x_out, OP op, VType b,
   auto tp_s = getCol<GVType> (s, tp);
   auto yp_s = getCol<GVType> (s, yp);
   //
-  MType CTY ("CTY",  2*s+1, 3);
+  MType CTY ("CTY",  ldc, 3);
   auto c_s = getCol<VType> (0, CTY);
   auto t_s = getCol<VType> (1, CTY);
   auto y_s = getCol<VType> (2, CTY);
   // workspace
-  GVType w_device ("w",  2*s+1);
-  GVType c2_device("c2", 2*s+1);
+  GVType w_device ("w",  ldt);
+  GVType c2_device("c2", ldc);
   auto c2 = Kokkos::create_mirror_view(c2_device);
   auto w  = Kokkos::create_mirror_view(w_device);
   #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-  int ldc = 2*s+1;
-  int ldt = 2*s+1;
   dd_real *c_dd  = (dd_real*)malloc(ldc*(s+1)*sizeof(dd_real));
   dd_real *t_dd  = (dd_real*)malloc(ldt*(s+1)*sizeof(dd_real));
   dd_real *w_dd  = (dd_real*)malloc(ldt      *sizeof(dd_real));
@@ -1675,9 +1675,12 @@ int cg_solve(VType x_out, OP op, VType b,
     auto t0 = getCol<GVType_host> (0, t);
     auto c0 = getCol<GVType_host> (0, c);
     auto y0 = getCol<GVType_host> (0, y);
-    Kokkos::deep_copy(t0, zero);
-    Kokkos::deep_copy(c0, zero);
-    Kokkos::deep_copy(y0, zero);
+    //Kokkos::deep_copy(t0, zero);
+    //Kokkos::deep_copy(c0, zero);
+    //Kokkos::deep_copy(y0, zero);
+    memset(t0.data(), 0, ldc*sizeof(double));
+    memset(c0.data(), 0, ldc*sizeof(double));
+    memset(y0.data(), 0, ldc*sizeof(double));
     t0(s+1) = one;
     c0(0) = one;
     #endif
@@ -1802,13 +1805,15 @@ int cg_solve(VType x_out, OP op, VType b,
                    ci1_dd, 1);
       #else
       // update y = y + alpha*c
-      Kokkos::deep_copy(yi1, yi0);
+      //Kokkos::deep_copy(yi1, yi0);
+      memcpy(yi1.data(), yi0.data(), ldt*sizeof(double));
       cblas_xaxpy (
             2*s+1, 
             alpha, ci0.data(), 1,
                    yi1.data(), 1);
       // update t = t - alpha*c2
-      Kokkos::deep_copy(ti1, ti0);
+      //Kokkos::deep_copy(ti1, ti0);
+      memcpy(ti1.data(), ti0.data(), ldt*sizeof(double));
       cblas_xaxpy (
             2*s+1, 
            -alpha, c2.data(),  1,
@@ -1822,7 +1827,8 @@ int cg_solve(VType x_out, OP op, VType b,
       beta1 = cblas_xdot(2*s+1, w.data(), 1, ti1.data(), 1);
       beta = beta1 / alpha1;
       // update c = t + beta*c
-      Kokkos::deep_copy(ci1, ti1);
+      //Kokkos::deep_copy(ci1, ti1);
+      memcpy(ci1.data(), ti1.data(), ldt*sizeof(double));
       cblas_xaxpy (
             2*s+1, 
             beta, ci0.data(), 1,
