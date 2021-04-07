@@ -9,59 +9,58 @@ extern "C" {
 //  double x[2];
 //};
 
+inline __host__ __device__ double dd_two_sum(volatile double a, volatile double b, volatile double &err) {
+  double s = a + b;
+  double bb = s - a;
+  err = (a - (s - bb)) + (b - bb);
+  return s;
+}
+
 #define IEEE_754
 #ifdef  IEEE_754
 inline __host__ __device__ void dd_add(const volatile double &a_hi, const volatile double &a_lo,
                                        const volatile double &b_hi, const volatile double &b_lo,
                                              volatile double &c_hi,       volatile double &c_lo)
 {
-    double s1,s2;
-    double v;
-    double t1,t2;
-
     // Two-Sum(a_hi,b_hi)->(s1,s2)
-    s1 = a_hi + b_hi;
-    v = s1 - a_hi;
-    s2 = ((b_hi - v) + (a_hi - (s1 - v)));
+    double s1,s2;
+    s1 = dd_two_sum(a_hi, b_hi, s2);
     // Two-Sum(a_lo,b_lo)->(t1,t2)
-    t1 = a_lo + b_lo;
-    v = t1 - a_lo;
-    t2 = ((b_lo - v) + (a_lo - (t1 - v)));
+    double t1,t2;
+    t1 = dd_two_sum(a_lo, b_lo, t2);
 
+    // s2+=t1
     s2 = s2 + t1;
 
-    t1 = s1 + s2;
-    s2 = s2 - (t1 - s1);
+    // Two-Sum(s1,s2)->(s1,s2)
+    s1 = dd_two_sum(s1, s2, s2);
 
-    s2 = t2 + s2;
+    // u2+=t2
+    s2 = s2 + t2;
 
-    c_hi = t1 + t2;
-    c_lo = t2 - (c_hi - t1);
+    // Two-Sum(s1,s2)->(c_hi,c_lo)
+    c_hi = dd_two_sum(s1, s2, c_lo);
 }
 #else
+inline __host__ __device__ double dd_quick_two_sum(volatile double a, volatile double b, volatile double &err) {
+  double s = a + b;
+  err = b - (s - a);
+  return s;
+}
+
 inline __host__ __device__ void dd_add(const volatile double &a_hi, const volatile double &a_lo,
                                        const volatile double &b_hi, const volatile double &b_lo,
                                              volatile double &c_hi,       volatile double &c_lo)
 {
-    double s1,s2;
-    double v;
-    double t1,t2;
-
     //s = qd::two_sum(a.x[0], b.x[0], e);
-    s1 = a_hi + b_hi;
-    v = s1 - a_hi;
-    s2 = ((b_hi - v) + (a_hi - (s1 - v)));
+    double s1,s2;
+    s1 = dd_two_sum(a_hi, b_hi, s2);
 
     //e += (a.x[1] + b.x[1]);
-    s2 = s2 + (a_lo + b_lo);
+    s2 = s2 + a_lo;
 
     //s = qd::quick_two_sum(s, e, e);
-    //return dd_real(s, e);
-    t1 = s1 + s2;
-    t2 = s2 - (t1 - s1);
-
-    c_hi = t1;
-    c_lo = t2;
+    c_hi = dd_quick_two_sum(s1, s2, c_lo);
 }
 #endif
 

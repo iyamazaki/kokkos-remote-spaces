@@ -1613,7 +1613,7 @@ int cg_solve(VType x_out, OP op, VType b,
     if (time_dot_on) {
       time_dot_comm += timer_dot.seconds();
     }
-    #if 1//defined(KOKKOS_DEBUG_CGSOLVER)
+    #if defined(KOKKOS_DEBUG_CGSOLVER)
     if (myRank == printRank) {
       Kokkos::deep_copy(V_local, V);
       Kokkos::deep_copy(V_host, V_local);
@@ -1775,7 +1775,7 @@ int cg_solve(VType x_out, OP op, VType b,
 
       // > alpha = alpha1/alpha2
       alpha = alpha1 / alpha2;
-      printf( " alpha1 = %.2e+%.2e, alpha2=%.2e+%.2e, alpha=%.2e+%.2e\n",alpha1.x[0],alpha1.x[1], alpha2.x[0],alpha2.x[1], alpha.x[0],alpha.x[1] );
+      //printf( " alpha1 = %.2e+%.2e, alpha2=%.2e+%.2e, alpha=%.2e+%.2e\n",alpha1.x[0],alpha1.x[1], alpha2.x[0],alpha2.x[1], alpha.x[0],alpha.x[1] );
       #else
       // > alpha2 = c'*(G*c2)
       cblas_xgemv (CblasColMajor, CblasNoTrans,
@@ -1808,7 +1808,7 @@ int cg_solve(VType x_out, OP op, VType b,
              zero_dd, w_dd,   1);
       beta1 = Rdot(2*s+1, w_dd, 1, ti1_dd, 1);
       beta = beta1 / alpha1;
-      printf( " beta1 = %.2e+%.2e, beta=%.2e+%.2e\n\n",beta1.x[0],beta1.x[1], beta.x[0],beta.x[1] );
+      //printf( " beta1 = %.2e+%.2e, beta=%.2e+%.2e\n\n",beta1.x[0],beta1.x[1], beta.x[0],beta.x[1] );
       // update c = t + beta*c
       memcpy(ci1_dd, ti1_dd, ldt*sizeof(dd_real));
       Raxpy (2*s+1, 
@@ -1846,7 +1846,7 @@ int cg_solve(VType x_out, OP op, VType b,
                   ci1.data(), 1);
       #endif
     }
-    #if 1//defined(KOKKOS_DEBUG_CGSOLVER)
+    #if defined(KOKKOS_DEBUG_CGSOLVER)
     if (myRank == printRank) {
       #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
       printf("y_hi = [\n" );
@@ -2588,26 +2588,17 @@ int main(int argc, char *argv[]) {
       MType x0_global("x0",  n, 1);
       VType c_sub("c", b_sub.extent(0));
 
+      // c = A*ones
       Kokkos::deep_copy(x0_global, one);
       op.apply(c_sub, x0_global);
 
-{
-  auto c_host = Kokkos::create_mirror_view(c_sub);
-  Kokkos::deep_copy(c_host, c_sub);
-  for (int i=0; i < c_host.extent(0); i++) printf( "%d %e\n",i,c_host(i) );
-}
-
+      // bnorm = norm(c)
       scalar_type bnorm = 0.0;
       dot(c_sub, c_sub, bnorm);
       bnorm = std::sqrt(bnorm);
 
+      // c = c / norm(c)
       axpby(b_sub, one/bnorm, c_sub, zero, b_sub);
-{
-  printf( " bnorm = %e\n",bnorm );
-  auto b_host = Kokkos::create_mirror_view(b_sub);
-  Kokkos::deep_copy(b_host, b_sub);
-  for (int i=0; i < b_host.extent(0); i++) printf( "%d %e\n",i,b_host(i) );
-}
     }
 
     // call CG
