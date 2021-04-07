@@ -78,7 +78,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using         memory_space = typename execution_space::memory_space;
 
-#define USE_FLOAT
+//#define USE_FLOAT
 #define USE_MIXED_PRECISION
 #if defined(USE_FLOAT)
  using      scalar_type = float;
@@ -1350,7 +1350,7 @@ int cg_solve(VType x_out, OP op, VType b,
   dd_real zero_dd = {0.0, 0.0};;
   #endif
   //#define KOKKOS_DEBUG_CGSOLVER
-  #if defined(KOKKOS_DEBUG_CGSOLVER)
+  #if 1//defined(KOKKOS_DEBUG_CGSOLVER)
   MType V_local ("V_local", nloc, 2*s+1);
   auto  V_global_host = Kokkos::create_mirror_view(V_global);
   auto  r_host   = Kokkos::create_mirror_view(r);
@@ -1572,7 +1572,7 @@ int cg_solve(VType x_out, OP op, VType b,
        #else
        DotBasedGEMM_dd<execution_space, MType, MType, GMType, dot_checks_type> gemm(one,  V, V,
                                                                                     zero, T_device, T_lo_device,
-                                                                                   dot_checks);
+                                                                                    dot_checks);
        gemm.run();
        #endif
       #endif // defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
@@ -1613,7 +1613,7 @@ int cg_solve(VType x_out, OP op, VType b,
     if (time_dot_on) {
       time_dot_comm += timer_dot.seconds();
     }
-    #if defined(KOKKOS_DEBUG_CGSOLVER)
+    #if 1//defined(KOKKOS_DEBUG_CGSOLVER)
     if (myRank == printRank) {
       Kokkos::deep_copy(V_local, V);
       Kokkos::deep_copy(V_host, V_local);
@@ -1636,6 +1636,14 @@ int cg_solve(VType x_out, OP op, VType b,
       printf("perm = [\n" );
       for (int i = 0; i < 2*s+1; i++) printf( "%d\n",perm[i] );
       printf("];\n");
+      #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+      printf("T = [\n" );
+      for (int i = 0; i < 2*s+1; i++) {
+        for (int j = 0; j < 2*s+1; j++) printf("%.2e+%.2e ",T(i,j),T_lo(i,j));
+        printf("\n");
+      }
+      printf("];\n");
+      #else
       printf("T = [\n" );
       for (int i = 0; i < 2*s+1; i++) {
         for (int j = 0; j < 2*s+1; j++) printf("%.2e ",T(i,j));
@@ -1648,6 +1656,7 @@ int cg_solve(VType x_out, OP op, VType b,
         printf("\n");
       }
       printf("];\n");
+      #endif
     }
     #endif
 
@@ -1766,6 +1775,7 @@ int cg_solve(VType x_out, OP op, VType b,
 
       // > alpha = alpha1/alpha2
       alpha = alpha1 / alpha2;
+      printf( " alpha1 = %.2e+%.2e, alpha2=%.2e+%.2e, alpha=%.2e+%.2e\n",alpha1.x[0],alpha1.x[1], alpha2.x[0],alpha2.x[1], alpha.x[0],alpha.x[1] );
       #else
       // > alpha2 = c'*(G*c2)
       cblas_xgemv (CblasColMajor, CblasNoTrans,
@@ -1798,6 +1808,7 @@ int cg_solve(VType x_out, OP op, VType b,
              zero_dd, w_dd,   1);
       beta1 = Rdot(2*s+1, w_dd, 1, ti1_dd, 1);
       beta = beta1 / alpha1;
+      printf( " beta1 = %.2e+%.2e, beta=%.2e+%.2e\n\n",beta1.x[0],beta1.x[1], beta.x[0],beta.x[1] );
       // update c = t + beta*c
       memcpy(ci1_dd, ti1_dd, ldt*sizeof(dd_real));
       Raxpy (2*s+1, 
@@ -1835,7 +1846,7 @@ int cg_solve(VType x_out, OP op, VType b,
                   ci1.data(), 1);
       #endif
     }
-    #if defined(KOKKOS_DEBUG_CGSOLVER)
+    #if 1//defined(KOKKOS_DEBUG_CGSOLVER)
     if (myRank == printRank) {
       #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
       printf("y_hi = [\n" );
@@ -1900,9 +1911,9 @@ int cg_solve(VType x_out, OP op, VType b,
     for (int i = 0; i < 2*s+1; i++) {
       for (int j = 0; j < s+1; j++) {
         #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-        yp(i,j) = y_dd[perm[i] + j*ldt].x[0];
-        cp(i,j) = c_dd[perm[i] + j*ldc].x[0];
-        tp(i,j) = t_dd[perm[i] + j*ldt].x[0];
+        yp(i,j) = y_dd[perm[i] + j*ldt].x[0] + y_dd[perm[i] + j*ldt].x[1];
+        cp(i,j) = c_dd[perm[i] + j*ldc].x[0] + c_dd[perm[i] + j*ldc].x[1];
+        tp(i,j) = t_dd[perm[i] + j*ldt].x[0] + t_dd[perm[i] + j*ldt].x[1];
         #else
         yp(i,j) = y(perm[i], j);
         cp(i,j) = c(perm[i], j);
@@ -2179,6 +2190,11 @@ int main(int argc, char *argv[]) {
   {
     int loop              = 2;
 
+    bool         strakos  = false;
+    scalar_type  strakos_l1 = 1e-3;
+    scalar_type  strakos_ln = 1e+2;
+    scalar_type  strakos_p  = 0.65;
+
     int N                 = 100;
     int nx                = 0;
     int max_iter          = 200;
@@ -2250,6 +2266,10 @@ int main(int argc, char *argv[]) {
         check = true;
         continue;
       }
+      if((strcmp(argv[i],"-strakos")==0)) {
+        strakos = true;
+        continue;
+      }
       if((strcmp(argv[i],"-sort")==0)) {
         sort_matrix = true;
         continue;
@@ -2285,7 +2305,38 @@ int main(int argc, char *argv[]) {
     HAType h_A;
     HAType h_G;
     VTypeHost h_b;
-    if (matrixFilename != "" || nx > 0) {
+    if (strakos) {
+      if (numRanks == 1) {
+        n = N;
+        nlocal = n;
+        start_row = 0;
+        end_row = n;
+        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
+          "Matrix::rowPtr", N+1);
+        Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+          "Matrix::colInd", N);
+        Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
+          "MM_Matrix::values", N);
+
+        rowPtr(0) = 0;
+        colInd(0) = 0;
+        nzVal(0)  = strakos_l1;
+        rowPtr(1) = 1;
+        for (int i = 1; i < N-1; i++) {
+          scalar_type val1 = strakos_ln - strakos_l1;
+          scalar_type val2 = ((scalar_type)(i))/((scalar_type)(N-1));
+          colInd(i) =  i;
+          nzVal (i) =  strakos_l1 + val1 * val2 * pow(strakos_p, N-(i+1));
+          rowPtr(i+1) = i+1;
+        }
+        colInd(N-1) = N-1;
+        nzVal (N-1) = strakos_ln;
+        rowPtr(N)   = N;
+        h_A = HAType (rowPtr, colInd, nzVal, N);
+      }
+      h_b = VTypeHost("b_h", n);
+      Kokkos::deep_copy(h_b, one);
+    } else if (matrixFilename != "" || nx > 0) {
       scalar_type *values;
       int *col_idx;
       int *row_ptr;
@@ -2511,14 +2562,14 @@ int main(int argc, char *argv[]) {
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
         //fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
         //fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
-        printf("%d %d %e\n",i,h_A.col_idx(k),h_A.values(k) );
+        printf("%d %d %.16e\n",i,h_A.col_idx(k),h_A.values(k) );
       }
     }
-    fclose(fp);
-    sprintf(filename,"b%d_%d.dat",numRanks, myRank);
+    fclose(fp);*/
+    /*sprintf(filename,"b%d_%d.dat",numRanks, myRank);
     fp = fopen(filename, "w");
     for (int i=0; i<h_b.extent(0); i++) {
-      printf("%e\n",h_b(i));
+      fprintf(fp,"%e\n",h_b(i));
     }
     fclose(fp);*/
 
@@ -2533,6 +2584,31 @@ int main(int argc, char *argv[]) {
 
     // local sol on device
     VType x_sub("x", b_sub.extent(0));
+    if (strakos) {
+      MType x0_global("x0",  n, 1);
+      VType c_sub("c", b_sub.extent(0));
+
+      Kokkos::deep_copy(x0_global, one);
+      op.apply(c_sub, x0_global);
+
+{
+  auto c_host = Kokkos::create_mirror_view(c_sub);
+  Kokkos::deep_copy(c_host, c_sub);
+  for (int i=0; i < c_host.extent(0); i++) printf( "%d %e\n",i,c_host(i) );
+}
+
+      scalar_type bnorm = 0.0;
+      dot(c_sub, c_sub, bnorm);
+      bnorm = std::sqrt(bnorm);
+
+      axpby(b_sub, one/bnorm, c_sub, zero, b_sub);
+{
+  printf( " bnorm = %e\n",bnorm );
+  auto b_host = Kokkos::create_mirror_view(b_sub);
+  Kokkos::deep_copy(b_host, b_sub);
+  for (int i=0; i < b_host.extent(0); i++) printf( "%d %e\n",i,b_host(i) );
+}
+    }
 
     // call CG
     if (myRank == 0) {
