@@ -57,16 +57,24 @@
 /* ------------------------------------------------------------------------------------ */
 namespace ReduceDD {
    struct dd_sum {
+     double a; // input
+     double b; // input
+
      double val_hi;
      double val_lo;
 
      KOKKOS_INLINE_FUNCTION   // Default constructor - Initialize to 0's
-     dd_sum() { 
+     dd_sum() {
+       a = 0.0;
+       b = 0.0;
        val_hi = 0.0;
        val_lo = 0.0;
      }
      KOKKOS_INLINE_FUNCTION   // Copy Constructor
      dd_sum(const dd_sum & rhs) { 
+       a = rhs.a;
+       b = rhs.b;
+
        val_hi = rhs.val_hi;
        val_lo = rhs.val_lo;
      }
@@ -75,6 +83,8 @@ namespace ReduceDD {
        #if 0
        val_hi += src.val_hi;
        #else
+       dd_mad(val_hi, val_lo,
+              a, b);
        dd_add(src.val_hi, src.val_lo,
                   val_hi,     val_lo);
        #endif
@@ -86,6 +96,8 @@ namespace ReduceDD {
        #if 0
        val.x[0] += src.val.x[0];
        #else
+       dd_mad(val_hi, val_lo,
+              a, b);
        dd_add( src.val_hi, src.val_lo,
                   val_hi,     val_lo);
        #endif
@@ -274,10 +286,15 @@ struct DotBasedGEMM_dd{
           #if 0
           update.val_hi += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
           #else
-          double a = alpha * A(baseInd+k, rowId);
-          double b =         B(baseInd+k, colId);
-          dd_mad(update.val_hi, update.val_lo,
-                 a, b);
+           double a = alpha * A(baseInd+k, rowId);
+           double b =         B(baseInd+k, colId);
+           #if 1
+           update.a = a;
+           update.b = b;
+           #else
+           dd_mad(update.val_hi, update.val_lo,
+                  a, b);
+           #endif
           #endif
         }
      }, Kokkos::Sum<ReduceDD::dd_sum>(result) );
