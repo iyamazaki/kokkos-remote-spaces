@@ -75,8 +75,7 @@ namespace ReduceDD {
        #if 0
        val_hi += src.val_hi;
        #else
-       dd_add(    val_hi,     val_lo,
-              src.val_hi, src.val_lo,
+       dd_add(src.val_hi, src.val_lo,
                   val_hi,     val_lo);
        #endif
 
@@ -87,8 +86,7 @@ namespace ReduceDD {
        #if 0
        val.x[0] += src.val.x[0];
        #else
-       dd_add(    val_hi,     val_lo,
-              src.val_hi, src.val_lo,
+       dd_add( src.val_hi, src.val_lo,
                   val_hi,     val_lo);
        #endif
      }
@@ -274,7 +272,7 @@ struct DotBasedGEMM_dd{
     Kokkos::parallel_reduce(Kokkos::TeamThreadRange(teamMember, chunkSize), [&](const size_A k, ReduceDD::dd_sum &update ) {
         if(baseInd + k < dotSize) {
           #if 0
-          update.val.x[0] += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
+          update.val_hi += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
           #else
           double a = alpha * A(baseInd+k, rowId);
           double b =         B(baseInd+k, colId);
@@ -307,7 +305,6 @@ struct DotBasedGEMM_dd{
       Kokkos::atomic_add(&C(rowId, colId), local_result);
       #else
       dd_add(result.val_hi, result.val_lo,
-             C_hi(rowId, colId), C_lo(rowId, colId),
              C_hi(rowId, colId), C_lo(rowId, colId));
       #endif
 

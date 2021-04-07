@@ -1465,15 +1465,6 @@ int cg_solve(VType x_out, OP op, VType b,
     }
     // V(0) = p
     // V(1) = r
-    if (time_spmv_on) {
-      Kokkos::fence();
-      timer_copy.reset();
-    }
-    //local_copy(p1, r);
-    if (time_spmv_on) {
-      Kokkos::fence();
-      time_spmv_copy += timer_copy.seconds();
-    }
     // V(2) = A*p
     auto p2 = getCol<VType> (2, V);
     op.apply(p2, V_global);
@@ -1609,7 +1600,6 @@ int cg_solve(VType x_out, OP op, VType b,
         #endif
       }
     }
-    Kokkos::fence();
     if (time_dot_on) {
       time_dot_comm += timer_dot.seconds();
     }
@@ -1633,9 +1623,9 @@ int cg_solve(VType x_out, OP op, VType b,
         }
         printf("];\n");
       }*/
-      printf("perm = [\n" );
-      for (int i = 0; i < 2*s+1; i++) printf( "%d\n",perm[i] );
-      printf("];\n");
+      //printf("perm = [\n" );
+      //for (int i = 0; i < 2*s+1; i++) printf( "%d\n",perm[i] );
+      //printf("];\n");
       #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
       printf("T = [\n" );
       for (int i = 0; i < 2*s+1; i++) {
