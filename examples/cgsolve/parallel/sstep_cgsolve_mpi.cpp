@@ -1293,6 +1293,9 @@ int cg_solve(VType x_out, OP op, VType b,
   dd_real *B_dd = (dd_real*)malloc(ldb * (2*s+1) * sizeof(dd_real));
   dd_real *G_dd = (dd_real*)malloc(ldg * (2*s+1) * sizeof(dd_real));
 
+  using DDType = Kokkos::View<ReduceDD::dd_sum**>;
+  DDType DD_device("DD", 2*s+1, 2*s+1);
+
   #if 1
   GMType T_dd ("T_dd",  2*s+1, 2*(2*s+1));
   Kokkos::pair<int, int> dd_hi_cols(0,     1*(2*s+1));
@@ -1561,10 +1564,22 @@ int cg_solve(VType x_out, OP op, VType b,
        gemm.run(false);
        Kokkos::deep_copy(T_lo_device, zero);
        #else
-       DotBasedGEMM_dd<execution_space, MType, MType, GMType, dot_checks_type> gemm(one,  V, V,
-                                                                                    zero, T_device, T_lo_device,
+       DotBasedGEMM_dd<execution_space, MType, MType, GMType, DDType, dot_checks_type> gemm(one,  V, V,
+                                                                                    zero, T_device, T_lo_device, DD_device,
                                                                                     dot_checks);
        gemm.run();
+
+       // copying DD into T (aka MPI buffer)
+       Kokkos::parallel_for(
+         "copy-DD-T", 2*s+1,
+         KOKKOS_LAMBDA(const int & i) {
+           for (int j = 0; j < 2*s+1; j++) {
+             T_device(i,j) = DD_device(i,j).val_hi;
+           }
+           for (int j = 0; j < 2*s+1; j++) {
+             T_lo_device(i,j) = DD_device(i,j).val_lo;
+           }
+         });
        #endif
       #endif // defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
       #endif
@@ -1605,6 +1620,7 @@ int cg_solve(VType x_out, OP op, VType b,
     }
     #if defined(KOKKOS_DEBUG_CGSOLVER)
     if (myRank == printRank) {
+      printf("\n");
       Kokkos::deep_copy(V_local, V);
       Kokkos::deep_copy(V_host, V_local);
       /*printf("V = [\n" );
@@ -1901,9 +1917,9 @@ int cg_solve(VType x_out, OP op, VType b,
     for (int i = 0; i < 2*s+1; i++) {
       for (int j = 0; j < s+1; j++) {
         #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-        yp(i,j) = y_dd[perm[i] + j*ldt].x[0] + y_dd[perm[i] + j*ldt].x[1];
-        cp(i,j) = c_dd[perm[i] + j*ldc].x[0] + c_dd[perm[i] + j*ldc].x[1];
-        tp(i,j) = t_dd[perm[i] + j*ldt].x[0] + t_dd[perm[i] + j*ldt].x[1];
+        yp(i,j) = y_dd[perm[i] + j*ldt].x[0]; //+ y_dd[perm[i] + j*ldt].x[1];
+        cp(i,j) = c_dd[perm[i] + j*ldc].x[0]; //+ c_dd[perm[i] + j*ldc].x[1];
+        tp(i,j) = t_dd[perm[i] + j*ldt].x[0]; //+ t_dd[perm[i] + j*ldt].x[1];
         #else
         yp(i,j) = y(perm[i], j);
         cp(i,j) = c(perm[i], j);
@@ -1984,7 +2000,6 @@ int cg_solve(VType x_out, OP op, VType b,
                                 &(one),  PRX.data(), nloc);
     //local_copy(p0, p);
     local_mv_copy(V01, PR);
-    Kokkos::fence();
     #endif
     if (time_axpy_on) {
       time_axpy += timer_axpy.seconds();

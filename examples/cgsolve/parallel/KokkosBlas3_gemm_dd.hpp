@@ -57,34 +57,26 @@
 /* ------------------------------------------------------------------------------------ */
 namespace ReduceDD {
    struct dd_sum {
-     double a; // input
-     double b; // input
-
      double val_hi;
      double val_lo;
 
      KOKKOS_INLINE_FUNCTION   // Default constructor - Initialize to 0's
      dd_sum() {
-       a = 0.0;
-       b = 0.0;
        val_hi = 0.0;
        val_lo = 0.0;
      }
-     KOKKOS_INLINE_FUNCTION   // Copy Constructor
-     dd_sum(const dd_sum & rhs) { 
-       a = rhs.a;
-       b = rhs.b;
 
-       val_hi = rhs.val_hi;
-       val_lo = rhs.val_lo;
+     KOKKOS_INLINE_FUNCTION   // Copy Constructor
+     dd_sum(const dd_sum & src) { 
+       val_hi = src.val_hi;
+       val_lo = src.val_lo;
      }
+
      KOKKOS_INLINE_FUNCTION   // add operator
      dd_sum& operator += (const dd_sum& src) {
        #if 0
        val_hi += src.val_hi;
        #else
-       dd_mad(val_hi, val_lo,
-              a, b);
        dd_add(src.val_hi, src.val_lo,
                   val_hi,     val_lo);
        #endif
@@ -94,15 +86,93 @@ namespace ReduceDD {
      KOKKOS_INLINE_FUNCTION   // volatile add operator 
      void operator += (const volatile dd_sum& src) volatile {
        #if 0
-       val.x[0] += src.val.x[0];
+       val_hi += src.val_hi;
        #else
-       dd_mad(val_hi, val_lo,
-              a, b);
-       dd_add( src.val_hi, src.val_lo,
+       dd_add(src.val_hi, src.val_lo,
                   val_hi,     val_lo);
        #endif
      }
+
+     KOKKOS_INLINE_FUNCTION   // add operator
+     dd_sum& operator + (const dd_sum& src) {
+       dd_add(src.val_hi, src.val_lo,
+                  val_hi,     val_lo);
+
+       return *this;
+     }
+     KOKKOS_INLINE_FUNCTION   // volatile add operator 
+     void operator + (const volatile dd_sum& src) volatile {
+       dd_add(src.val_hi, src.val_lo,
+                  val_hi,     val_lo);
+     }
+
+    KOKKOS_INLINE_FUNCTION
+    void operator=(const volatile dd_sum &src) volatile {
+      val_hi = src.val_hi;
+      val_lo = src.val_lo;
+    }
+    KOKKOS_INLINE_FUNCTION
+    dd_sum&  operator=(const dd_sum &src) {
+      this->val_hi = src.val_hi;
+      this->val_lo = src.val_lo;
+      return *this;
+    }
    };
+  
+
+  struct dd_adder {
+    double *hi;
+    double *lo;
+
+    KOKKOS_INLINE_FUNCTION
+    dd_adder () {
+      //hi = 0.0;
+      //lo = 0.0;
+    }
+
+    KOKKOS_INLINE_FUNCTION
+    dd_adder (double* _hi, double* _lo) {
+      hi = _hi;
+      lo =_lo;
+    }
+
+    KOKKOS_INLINE_FUNCTION
+    void  operator+ (const volatile dd_adder &a) volatile {
+      dd_add(*(a.hi), *(a.lo), *(this->hi), *(this->lo));
+    }
+    KOKKOS_INLINE_FUNCTION
+    dd_adder& operator+ (const dd_adder &a) {
+#if 0
+      dd_add(*(a.hi), *(a.lo), *(this->hi), *(this->lo));
+#endif
+      return *this;
+    }
+
+    KOKKOS_INLINE_FUNCTION
+    void operator+=(const volatile dd_adder &a) volatile {
+      dd_add(*(a.hi), *(a.lo), *(this->hi), *(this->lo));
+    }
+    KOKKOS_INLINE_FUNCTION
+    dd_adder& operator+=(const dd_adder &a) {
+      dd_add(*(a.hi), *(a.lo), *(this->hi), *(this->lo));
+      return *this;
+    }
+
+    KOKKOS_INLINE_FUNCTION
+    void operator=(const volatile dd_adder &a) volatile {
+      *(this->hi) = *(a.hi);
+      *(this->lo) = *(a.lo);
+    }
+    KOKKOS_INLINE_FUNCTION
+    dd_adder&  operator=(const dd_adder &a) {
+#if 0
+      this->hi = a.hi;
+      this->lo = a.lo;
+#endif
+      return *this;
+    }
+  };
+
 }
 
 namespace Kokkos { //reduction identity must be defined in Kokkos namespace
@@ -115,17 +185,19 @@ namespace Kokkos { //reduction identity must be defined in Kokkos namespace
 }
 /* ------------------------------------------------------------------------------------ */
 
+
 struct TagZero{};      // The init tag for beta=0 
 struct TagInit{};      // The init tag for beta!=0 and beta !=1 
 struct TagInitCheck{}; // The init tag for checks
 struct TagMult{};      // The multiplication tag for transposed A
-template<class ExecSpace, class AV, class BV, class CV, class IV>
+template<class ExecSpace, class AV, class BV, class CV, class DD, class IV>
 struct DotBasedGEMM_dd{
 
   const AV A;
   const BV B;
   CV C_hi;
   CV C_lo;
+  DD C;
   IV checks;
 
   using scalar_A = typename AV::non_const_value_type;
@@ -151,12 +223,13 @@ struct DotBasedGEMM_dd{
 
   DotBasedGEMM_dd(const scalar_A& alpha_, const AV& A_,
                                           const BV& B_,
-                  const scalar_C& beta_,  const CV& C_hi_, const CV& C_lo_,
+                  const scalar_C& beta_,  const CV& C_hi_, const CV& C_lo_, const DD& C_,
                                           const IV& checks_) :
   A(A_),
   B(B_),
   C_hi(C_hi_),
   C_lo(C_lo_),
+  C(C_),
   alpha(alpha_),
   beta(beta_),
   checks(checks_),
@@ -230,12 +303,18 @@ struct DotBasedGEMM_dd{
   void operator() (const TagZero&, const size_C &rowId, const size_C &colId ) const {
     C_hi(rowId, colId) = CVT::zero(); 
     C_lo(rowId, colId) = CVT::zero();
+
+    C(rowId, colId).val_hi = CVT::zero(); 
+    C(rowId, colId).val_lo = CVT::zero();
   }
 
   KOKKOS_INLINE_FUNCTION
   void operator() (const TagInit&, const size_C &rowId, const size_C &colId ) const {
     C_hi(rowId, colId) = beta * C_hi(rowId, colId);
     C_lo(rowId, colId) = beta * C_lo(rowId, colId);
+
+    C(rowId, colId).val_hi = beta * C(rowId, colId).val_hi;
+    C(rowId, colId).val_lo = beta * C(rowId, colId).val_lo;
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -281,20 +360,14 @@ struct DotBasedGEMM_dd{
     result.val_lo = 0.0;
     #else
     ReduceDD::dd_sum result;
-    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(teamMember, chunkSize), [&](const size_A k, ReduceDD::dd_sum &update ) {
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(teamMember, chunkSize), [&](const size_A k, ReduceDD::dd_sum &update) {
         if(baseInd + k < dotSize) {
+          double a = alpha * A(baseInd+k, rowId);
+          double b =         B(baseInd+k, colId);
           #if 0
-          update.val_hi += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
+           update.val_hi += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
           #else
-           double a = alpha * A(baseInd+k, rowId);
-           double b =         B(baseInd+k, colId);
-           #if 1
-           update.a = a;
-           update.b = b;
-           #else
-           dd_mad(update.val_hi, update.val_lo,
-                  a, b);
-           #endif
+           dd_mad(a, b, update.val_hi, update.val_lo);
           #endif
         }
      }, Kokkos::Sum<ReduceDD::dd_sum>(result) );
@@ -307,27 +380,73 @@ struct DotBasedGEMM_dd{
     // ----------------------------------------------------------------------------
     // parallel-reduce of local "result" among teams
     Kokkos::single(Kokkos::PerTeam(teamMember), [&] () {
+#if 1
+      //ReduceDD::dd_adder cij (&(C_hi(rowId, colId)), &(C_lo(rowId, colId)));
+      //ReduceDD::dd_adder lij (&(result.val_hi),      &(result.val_lo));
+      //Kokkos::atomic_add(&cij, lij);
+      Kokkos::atomic_add(&C(rowId, colId), result);
+#else
+      const int free_val = 0;
+      const int busy_val = 1;
       #if 0
       double local_result = result.val.x[0] + result.val.x[1];
       Kokkos::atomic_add(&C(rowId, colId), local_result);
       #else
-      const int free_val = 0;
-      const int busy_val = 1;
       // busy wait
-      while (free_val != Kokkos::atomic_compare_exchange<int>(&checks(rowId, colId), free_val, busy_val)) {}
+      while (!Kokkos::atomic_compare_exchange_strong<int>(&checks(rowId, colId), free_val, busy_val)) {}
 
       // atomic-add
       #if 0
-      double local_result = result.val_hi + result.val_lo;
-      Kokkos::atomic_add(&C(rowId, colId), local_result);
-      #else
       dd_add(result.val_hi, result.val_lo,
              C_hi(rowId, colId), C_lo(rowId, colId));
+      #else
+       //double local_result = result.val_hi + result.val_lo;
+       //Kokkos::atomic_add(&C_hi(rowId, colId), local_result);
+       //C_hi(rowId, colId) += local_result;
+
+       // compute: result += local
+       #if 1
+//if (rowId == 0 && colId == 0) printf( " - %d: %e + %e, %e + %e\n",globalRank, C_hi(rowId, colId),C_lo(rowId, colId), result.val_hi,result.val_lo );
+#if 1
+       double local_hi = C_hi(rowId, colId);
+       double local_lo = C_lo(rowId, colId);
+//if (rowId == 0 && colId == 0) printf( " - %d: %e + %e, %e + %e\n",globalRank, local_hi,local_lo, result.val_hi,result.val_lo );
+       dd_add(result.val_hi, result.val_lo,
+              local_hi, local_lo);
+       C_hi(rowId, colId) = local_hi;
+       C_lo(rowId, colId) = local_lo;
+       //Kokkos::Impl::atomic_store<double>(&C_hi(rowId, colId), local_hi);
+       //Kokkos::Impl::atomic_store<double>(&C_lo(rowId, colId), local_lo);
+#else
+       double local_hi = 0.0; //C_hi(rowId, colId);
+       double local_lo = 0.0; //C_lo(rowId, colId);
+       dd_add(result.val_hi, result.val_lo,
+              local_hi, local_lo);
+       Kokkos::atomic_add(&C_hi(rowId, colId), local_hi);
+       Kokkos::atomic_add(&C_lo(rowId, colId), local_lo);
+#endif
+//if (rowId == 0 && colId == 0) printf( " + %d: %e + %e\n",globalRank, C_hi(rowId, colId),C_lo(rowId, colId) );
+       #else
+       local_hi += result.val_hi;
+       local_lo += result.val_lo;
+       #endif
+
+       // storing into C(i, j)
+       #if 1
+       //Kokkos::Impl::atomic_store<double>(&C_hi(rowId, colId), local_hi);
+       //Kokkos::Impl::atomic_store<double>(&C_lo(rowId, colId), local_lo);
+       //Kokkos::atomic_add(&C_hi(rowId, colId), local_hi);
+       //Kokkos::atomic_add(&C_lo(rowId, colId), local_lo);
+       #else
+       C_hi(rowId, colId) = local_hi;
+       C_lo(rowId, colId) = local_lo;
+       #endif
       #endif
 
       // free atomic
       Kokkos::Impl::atomic_store<int>(&checks(rowId, colId), free_val);
       #endif
+#endif
       });
     //if (rowId == 0 && colId == 0 && team_rank == 0) printf( " %d -> %e\n",globalRank,C(rowId,colId) );
     #else

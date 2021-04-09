@@ -22,7 +22,7 @@ double dd_quick_two_sum(volatile double a, volatile double b, volatile double &e
   return s;
 }
 
-#define IEEE_754
+//#define IEEE_754
 #ifdef  IEEE_754
 inline __host__ __device__
 void dd_add(const volatile double &a_hi, const volatile double &a_lo,
@@ -31,7 +31,6 @@ void dd_add(const volatile double &a_hi, const volatile double &a_lo,
     // Two-Sum(a_hi,b_hi)->(s1,s2)
     double s1,s2;
     s1 = dd_two_sum(a_hi, b_hi, s2);
-#if 1
     // Two-Sum(a_lo,b_lo)->(t1,t2)
     double t1,t2;
     t1 = dd_two_sum(a_lo, b_lo, t2);
@@ -44,9 +43,6 @@ void dd_add(const volatile double &a_hi, const volatile double &a_lo,
 
     // u2+=t2
     s2 += t2;
-#else
-    s2 += a_lo;
-#endif
 
     // Two-Sum(s1,s2)->(b_hi, b_lo)
     b_hi = dd_quick_two_sum(s1, s2, b_lo);
@@ -145,9 +141,9 @@ void dd2_mul(const volatile double &a,
 #endif
 
 inline __host__ __device__
-void dd_mad(      volatile double &c_hi, volatile double &c_lo,
-            const volatile double &a,
-            const volatile double &b)
+void dd_mad(const volatile double &a,
+            const volatile double &b,
+            volatile double &c_hi, volatile double &c_lo)
 {
 #if 0
     c_hi += a* b;
