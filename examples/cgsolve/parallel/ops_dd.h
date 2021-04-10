@@ -86,7 +86,8 @@ void dd_add(const volatile double &a_hi, const volatile double &a_lo,
 }
 #endif
 
-#if 0
+
+#if 1
 #define _QD_SPLITTER 134217729.0               // = 2^27 + 1
 #define _QD_SPLIT_THRESH 6.69692879491417e+299 // = 2^996
 inline __host__ __device__

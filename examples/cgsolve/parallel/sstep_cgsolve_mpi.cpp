@@ -79,7 +79,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 using         memory_space = typename execution_space::memory_space;
 
 //#define USE_FLOAT
-#define USE_MIXED_PRECISION
+//#define USE_MIXED_PRECISION
 #if defined(USE_FLOAT)
  using      scalar_type = float;
 
@@ -1131,7 +1131,7 @@ void local_init(XType x, scalar_type val) {
 
 template <class XType, class YType>
 void local_mv_copy(XType x, YType y) {
-  #if 0
+  #if 1
   int m = x.extent(0);
   int n = x.extent(1);
   Kokkos::parallel_for(
@@ -1215,7 +1215,6 @@ int cg_solve(VType x_out, OP op, VType b,
   using GVType_host = typename GVType::HostMirror;
   using  VType_host = typename  VType::HostMirror;
   using  DView = Kokkos::View<scalar_type*>;
-  using dot_checks_type = Kokkos::View<int**>;
 
   int myRank, numRanks;
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
@@ -1288,32 +1287,31 @@ int cg_solve(VType x_out, OP op, VType b,
   auto B  = Kokkos::create_mirror_view(B_device);
   // Gram
   #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-  int ldg = 2*s+1;
-  int ldb = 2*s+1;
-  dd_real *B_dd = (dd_real*)malloc(ldb * (2*s+1) * sizeof(dd_real));
-  dd_real *G_dd = (dd_real*)malloc(ldg * (2*s+1) * sizeof(dd_real));
+   int ldg = 2*s+1;
+   int ldb = 2*s+1;
+   dd_real *B_dd = (dd_real*)malloc(ldb * (2*s+1) * sizeof(dd_real));
+   dd_real *G_dd = (dd_real*)malloc(ldg * (2*s+1) * sizeof(dd_real));
 
-  using DDType = Kokkos::View<ReduceDD::dd_sum**>;
-  DDType DD_device("DD", 2*s+1, 2*s+1);
+   using DDType = Kokkos::View<ReduceDD::dd_sum**>;
+   DDType DD_device("DD", 2*s+1, 2*s+1);
 
-  #if 1
-  GMType T_dd ("T_dd",  2*s+1, 2*(2*s+1));
-  Kokkos::pair<int, int> dd_hi_cols(0,     1*(2*s+1));
-  Kokkos::pair<int, int> dd_lo_cols(2*s+1, 2*(2*s+1));
-  auto T_device    = Kokkos::subview(T_dd, Kokkos::ALL (), dd_hi_cols);
-  auto T_lo_device = Kokkos::subview(T_dd, Kokkos::ALL (), dd_lo_cols);
-  #else
-  GMType T_device ("T",  2*s+1, 2*s+1);
-  GMType T_lo_device ("T_lo",  2*s+1, 2*s+1);
-  #endif
-  auto T_lo  = Kokkos::create_mirror_view(T_lo_device);
-  #else
-  GMType T_device ("T",  2*s+1, 2*s+1);
+   GMType T_dd_device ("T_dd",  2*s+1, 2*(2*s+1));
+   Kokkos::pair<int, int> dd_hi_cols(0,     1*(2*s+1));
+   Kokkos::pair<int, int> dd_lo_cols(2*s+1, 2*(2*s+1));
+   auto T_device    = Kokkos::subview(T_dd_device, Kokkos::ALL (), dd_hi_cols);
+   auto T_lo_device = Kokkos::subview(T_dd_device, Kokkos::ALL (), dd_lo_cols);
+
+   auto T_dd  = Kokkos::create_mirror_view(T_dd_device);
+   //auto T  = Kokkos::create_mirror_view(T_device);
+   //auto T_lo  = Kokkos::create_mirror_view(T_lo_device);
+   auto T    = Kokkos::subview(T_dd, Kokkos::ALL (), dd_hi_cols);
+   auto T_lo = Kokkos::subview(T_dd, Kokkos::ALL (), dd_lo_cols);
+  #else // not with DD
+   GMType T_device ("T",  2*s+1, 2*s+1);
+   auto T  = Kokkos::create_mirror_view(T_device);
   #endif
   GMType G_device ("G",  2*s+1, 2*s+1);
   auto G  = Kokkos::create_mirror_view(G_device);
-  auto T  = Kokkos::create_mirror_view(T_device);
-  dot_checks_type dot_checks("dot_checks", 2*s+1, 2*s+1);
   // alpha & beta
   int ldc = 2*s+1;
   int ldt = 2*s+1;
@@ -1541,7 +1539,7 @@ int cg_solve(VType x_out, OP op, VType b,
                      zero, T_device);
       #else
       KokkosBlas::Impl::
-      DotBasedGEMM<execution_space, GMType, GMType, GMType> gemm(one, V2, V2, zero, T_device);
+      DotBasedGEMM<execution_space, GMType, GMType, GMType> gemm(one, V2, V2, zero, T_device, true);
       gemm.run(false);
       #endif
     } else {
@@ -1554,7 +1552,7 @@ int cg_solve(VType x_out, OP op, VType b,
       // directly calling dot-based Gemm since for mixed precision, KokkosBlas::gemm ends up calling ``standard'' implementation
       #if defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
       KokkosBlas::Impl::
-      DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device);
+      DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device, true);
       gemm.run(false);
       #else
        #if 0
@@ -1564,9 +1562,8 @@ int cg_solve(VType x_out, OP op, VType b,
        gemm.run(false);
        Kokkos::deep_copy(T_lo_device, zero);
        #else
-       DotBasedGEMM_dd<execution_space, MType, MType, GMType, DDType, dot_checks_type> gemm(one,  V, V,
-                                                                                    zero, T_device, T_lo_device, DD_device,
-                                                                                    dot_checks);
+       DotBasedGEMM_dd<execution_space, MType, MType, DDType> gemm(one,  V, V,
+                                                                   zero, DD_device);
        gemm.run();
 
        // copying DD into T (aka MPI buffer)
@@ -1586,6 +1583,7 @@ int cg_solve(VType x_out, OP op, VType b,
     }
     #endif
     if (time_dot_on) {
+      Kokkos::fence();
       time_dot += timer_dot.seconds();
       flop_dot += (2*s+1)*(2*s+1)*(2*nloc-1);
       timer_dot.reset();
@@ -1594,24 +1592,30 @@ int cg_solve(VType x_out, OP op, VType b,
     if (numRanks > 1) {
       Kokkos::fence();
       #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-      MPI_Allreduce(MPI_IN_PLACE, T_dd.data(), 2*(2*s+1)*(2*s+1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE, T_dd_device.data(), 2*(2*s+1)*(2*s+1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
       #else
       MPI_Allreduce(MPI_IN_PLACE, T_device.data(), (2*s+1)*(2*s+1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
       #endif
     }
-    Kokkos::deep_copy(T, T_device);
     #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-    Kokkos::deep_copy(T_lo, T_lo_device);
+    Kokkos::deep_copy(T_dd, T_dd_device);
+    //Kokkos::deep_copy(T, T_device);
+    //Kokkos::deep_copy(T_lo, T_lo_device);
+    #else
+    Kokkos::deep_copy(T, T_device);
     #endif
 
     for (int i = 0; i < 2*s+1; i++) {
-      for (int j = 0; j < 2*s+1; j++) {
+      for (int j = i; j < 2*s+1; j++) {
         #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-        G(perm[i], perm[j]) = T(i, j) + T_lo(i, j);;
         G_dd[perm[i] + perm[j]*ldg].x[0] = T(i, j);
         G_dd[perm[i] + perm[j]*ldg].x[1] = T_lo(i, j);;
+
+        G_dd[perm[j] + perm[i]*ldg].x[0] = T(i, j);
+        G_dd[perm[j] + perm[i]*ldg].x[1] = T_lo(i, j);;
         #else
         G(perm[i], perm[j]) = T(i, j);
+        G(perm[j], perm[i]) = T(i, j);
         #endif
       }
     }
@@ -1693,9 +1697,9 @@ int cg_solve(VType x_out, OP op, VType b,
     //Kokkos::deep_copy(t0, zero);
     //Kokkos::deep_copy(c0, zero);
     //Kokkos::deep_copy(y0, zero);
-    memset(t0.data(), 0, ldc*sizeof(double));
-    memset(c0.data(), 0, ldc*sizeof(double));
-    memset(y0.data(), 0, ldc*sizeof(double));
+    memset(t0.data(), 0, ldc*sizeof(gram_scalar_type));
+    memset(c0.data(), 0, ldc*sizeof(gram_scalar_type));
+    memset(y0.data(), 0, ldc*sizeof(gram_scalar_type));
     t0(s+1) = one;
     c0(0) = one;
     #endif
@@ -1823,14 +1827,14 @@ int cg_solve(VType x_out, OP op, VType b,
       #else
       // update y = y + alpha*c
       //Kokkos::deep_copy(yi1, yi0);
-      memcpy(yi1.data(), yi0.data(), ldt*sizeof(double));
+      memcpy(yi1.data(), yi0.data(), ldt*sizeof(gram_scalar_type));
       cblas_xaxpy (
             2*s+1, 
             alpha, ci0.data(), 1,
                    yi1.data(), 1);
       // update t = t - alpha*c2
       //Kokkos::deep_copy(ti1, ti0);
-      memcpy(ti1.data(), ti0.data(), ldt*sizeof(double));
+      memcpy(ti1.data(), ti0.data(), ldt*sizeof(gram_scalar_type));
       cblas_xaxpy (
             2*s+1, 
            -alpha, c2.data(),  1,
@@ -1845,7 +1849,7 @@ int cg_solve(VType x_out, OP op, VType b,
       beta = beta1 / alpha1;
       // update c = t + beta*c
       //Kokkos::deep_copy(ci1, ti1);
-      memcpy(ci1.data(), ti1.data(), ldt*sizeof(double));
+      memcpy(ci1.data(), ti1.data(), ldt*sizeof(gram_scalar_type));
       cblas_xaxpy (
             2*s+1, 
             beta, ci0.data(), 1,
@@ -2002,6 +2006,7 @@ int cg_solve(VType x_out, OP op, VType b,
     local_mv_copy(V01, PR);
     #endif
     if (time_axpy_on) {
+      Kokkos::fence();
       time_axpy += timer_axpy.seconds();
       flop_axpy += 3*(4*s)*nloc;
     }
