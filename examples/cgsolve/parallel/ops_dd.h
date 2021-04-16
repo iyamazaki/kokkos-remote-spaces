@@ -1,3 +1,26 @@
+/*
+ * These subroutines are based on (but modified to test with Kokkos)
+ * from QD library for real double-double and quad-double arithmetic 
+ * which is based on modified BSD license.
+ *
+ * The original copyright is:
+ * 
+ * This work was supported by the Director, Office of Science, Division
+ * of Mathematical, Information, and Computational Sciences of the
+ * U.S. Department of Energy under contract numbers DE-AC03-76SF00098 and
+ * DE-AC02-05CH11231.
+ * 
+ * Copyright (c) 2003-2009, The Regents of the University of California,
+ * through Lawrence Berkeley National Laboratory (subject to receipt of
+ * any required approvals from U.S. Dept. of Energy) All rights reserved. 
+ * 
+ * By downloading or using this software you are agreeing to the modified
+ * BSD license that is in file "BSD-LBNL-License.doc" in the main ARPREC
+ * directory. If you wish to use the software for commercial purposes
+ * please contact the Technology Transfer Department at TTD@lbl.gov or
+ * call 510-286-6457.
+*/
+
 #ifndef OPS_DD_H
 #define OPS_DD_H
 
