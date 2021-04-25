@@ -75,7 +75,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using memory_space = typename execution_space::memory_space;
 
-#if 0
+#if 1
  using scalar_type = float;
 
  #define MPI_SCALAR        MPI_FLOAT
@@ -882,7 +882,7 @@ int cg_solve(VType x, OP op, VType b,
              VType p, VType p_global,
              int n, int start_row, int end_row,
              int max_iter, scalar_type tolerance,
-             bool replace_residual, scalar_type norma,
+             bool replace_residual, int replace_op, int maxNnzA, scalar_type norma,
              bool verbose, bool time_spmv_on, bool time_dot_on, bool time_axpy_on) {
 
   using DView = Kokkos::View<scalar_type*>;
@@ -942,8 +942,18 @@ int cg_solve(VType x, OP op, VType b,
   auto  p_host = Kokkos::create_mirror_view(p);
   auto Ap_host = Kokkos::create_mirror_view(Ap);
   #endif
+
   // for residual replacement
-  VType z("z",  nloc);
+  const auto eps = std::numeric_limits<scalar_type>::epsilon();
+  const scalar_type replace_tol = std::sqrt(eps);
+  scalar_type normx = 0.0;
+  scalar_type d_replace = 0.0;
+  scalar_type normr_prev = 0.0;
+  scalar_type d_replace_prev = 0.0;
+  scalar_type sum_x = 0.0;
+  scalar_type sum_r = 0.0;
+  VType z("z",  nloc); // store "group" update
+  VType w("w",  nloc); // workspace for computing explicit residual norm (w = x + z)
   Kokkos::deep_copy(z, zero);
 
   // to compute true-residual with verbose on
@@ -995,6 +1005,10 @@ int cg_solve(VType x, OP op, VType b,
   beta = *(dot_host.data());
   normr = std::sqrt(beta);
   tolerance *= normr;
+  if (replace_residual) {
+    sum_r = normr;
+    d_replace = (replace_tol/eps) * (maxNnzA * norma * sum_x + sum_r);
+  }
 
   if (verbose && myRank == 0) {
     std::cout << "Initial Residual = " << normr << std::endl;
@@ -1065,6 +1079,7 @@ int cg_solve(VType x, OP op, VType b,
       }
 
       // compute various scalars on host
+      normr_prev = normr;
       normr = std::sqrt(new_rr);
     }
 
@@ -1119,7 +1134,12 @@ int cg_solve(VType x, OP op, VType b,
     alpha = new_rr / pAp;
     if (verbose) {
       // r = b - A*x
-      Kokkos::deep_copy(x_sub, x);
+      if (replace_residual) {
+        axpby(w, one, x, one, z);  // w = x + z
+        Kokkos::deep_copy(x_sub, w);
+      } else {
+        Kokkos::deep_copy(x_sub, x);
+      }
       op.apply(Ax, x_global);           // Ax = A*x
       axpby(r_true, one, b, -one, Ax);  // r = b-Ax
 
@@ -1168,17 +1188,49 @@ int cg_solve(VType x, OP op, VType b,
     // ==============================================================================
     // replace residual vector, check
     if (replace_residual) {
-      // r = b - A*x
-      Kokkos::deep_copy(x_sub, x);
-      op.apply(Ax, x_global);        // Ax = A*x
-      axpby(r, one, b, -one, Ax);    // r = b-Ax
+      // compute norm(x) for now
+      dot(x, x, dot_result);
+      if (numRanks > 1) {
+        MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
+                      MPI_COMM_WORLD);
+      }
+      Kokkos::deep_copy(dot_host, dot_result);
+      normx = std::sqrt(*(dot_host.data()));
 
-      // z = z + x
-      axpby(z, one, z, one, x);
-      // x = zero
-      Kokkos::deep_copy(x, zero);
-      if (verbose && myRank == 0) {
-        std::cout << "  >> replace residual at Iteration = " << k << std::endl;
+      // accumulate
+      sum_x += normx;
+      sum_r += normr;
+
+      d_replace_prev = d_replace;
+      d_replace = (eps / replace_tol) * (maxNnzA * norma * sum_x + sum_r);
+      if (verbose) {
+        if (myRank == 0) {
+          std::cout << "  >> replace residual at Iteration = " << k << ", d = " << d_replace;
+        }
+      }
+      if (replace_op == 0 || (d_replace > normr && d_replace_prev <= normr_prev) ) {
+        // z = z + x
+        axpby(z, one, z, one, x);
+
+        // r = b - A*z
+        Kokkos::deep_copy(x_sub, z);
+        op.apply(Ax, x_global);        // Ax = A*x
+        axpby(r, one, b, -one, Ax);    // r = b-Ax
+
+        // x = zero
+        Kokkos::deep_copy(x, zero);
+
+        // update data
+        sum_x = 0.0;
+        sum_r = normr;
+        d_replace = (replace_tol/eps) * (maxNnzA * norma * sum_x + sum_r);
+        if (verbose && myRank == 0) {
+          std::cout << "  (replaced)" << std::endl;
+        }
+      } else {
+        if (verbose && myRank == 0) {
+          std::cout << "  (not replaced)" << std::endl;
+        }
       }
     }
 
@@ -1339,6 +1391,7 @@ int main(int argc, char *argv[]) {
     scalar_type tolerance = 1e-8;
     std::string matrixFilename {""};
 
+    int replace_op = 0; // 0: replace at every step
     bool replace_residual = false;
 
     #if defined(CGSOLVE_ENABLE_METIS)
@@ -1378,6 +1431,14 @@ int main(int argc, char *argv[]) {
       }
       if((strcmp(argv[i],"-v")==0)) {
         verbose = true;
+        continue;
+      }
+      if((strcmp(argv[i],"-rr")==0)) {
+        replace_residual = true;
+        continue;
+      }
+      if((strcmp(argv[i],"-rop")==0)) {
+        replace_op = atoi(argv[++i]);
         continue;
       }
       if((strcmp(argv[i],"-time-spmv")==0)) {
@@ -1731,12 +1792,17 @@ int main(int argc, char *argv[]) {
       axpby(b_sub, one/bnorm, c_sub, zero, b_sub);
     }
 
+    int maxNnzA = 0;
     scalar_type Anorm = 0.0;
     if (replace_residual) {
       VType p("p", b.extent(0));
       VType q_global("q",  n);
       VType q_sub = Kokkos::subview(q_global, bounds);
 
+      Anorm = n;
+      Anorm = std::sqrt(Anorm);
+      Kokkos::deep_copy(p, one);
+      axpby(p, one/Anorm, p, zero, p);
       for (int i = 0; i < 10; i++) {
         // r = b - A*x
         Kokkos::deep_copy(q_sub, p);
@@ -1752,6 +1818,16 @@ int main(int argc, char *argv[]) {
           std::cout << " norm(A) = " << Anorm << std::endl;;
         }
       }
+      if (myRank == 0) {
+        for (int i=0; i<n; i++) {
+          int nnzRowA = h_A.row_ptr(i+1) - h_A.row_ptr(i+1);
+          if (nnzRowA > maxNnzA) {
+            maxNnzA = nnzRowA;
+          }
+        }
+      }
+      MPI_Allreduce(MPI_IN_PLACE, &maxNnzA, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD);
     }
 
     // call CG
@@ -1779,7 +1855,7 @@ int main(int argc, char *argv[]) {
                                p_sub, p,
                                n, start_row, end_row,
                                max_iter, tolerance,
-                               replace_residual, Anorm,
+                               replace_residual, replace_op, maxNnzA, Anorm,
                                verbose, time_spmv, time_dot, time_axpy);
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
