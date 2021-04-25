@@ -882,6 +882,7 @@ int cg_solve(VType x, OP op, VType b,
              VType p, VType p_global,
              int n, int start_row, int end_row,
              int max_iter, scalar_type tolerance,
+             bool replace_residual, scalar_type norma,
              bool verbose, bool time_spmv_on, bool time_dot_on, bool time_axpy_on) {
 
   using DView = Kokkos::View<scalar_type*>;
@@ -941,6 +942,10 @@ int cg_solve(VType x, OP op, VType b,
   auto  p_host = Kokkos::create_mirror_view(p);
   auto Ap_host = Kokkos::create_mirror_view(Ap);
   #endif
+  // for residual replacement
+  VType z("z",  nloc);
+  Kokkos::deep_copy(z, zero);
+
   // to compute true-residual with verbose on
   Kokkos::pair<int, int> bounds(start_row, end_row);
   VType r_true  ("true_r",  nloc);
@@ -1112,7 +1117,7 @@ int cg_solve(VType x, OP op, VType b,
 
     // compute alpha
     alpha = new_rr / pAp;
-    if (verbose && myRank == 0) {
+    if (verbose) {
       // r = b - A*x
       Kokkos::deep_copy(x_sub, x);
       op.apply(Ax, x_global);           // Ax = A*x
@@ -1123,9 +1128,11 @@ int cg_solve(VType x, OP op, VType b,
       Kokkos::deep_copy(dot_host, dot_result);
       MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                     MPI_COMM_WORLD);
-      std::cout << "Iteration = " << k << "   Residual = " << normr << ", " << std::sqrt(*(dot_host.data()))
-                << ", beta = " << beta << ", alpha = " << alpha
-                << std::endl;
+      if (myRank == 0) {
+        std::cout << "Iteration = " << k << "   Residual = " << normr << ", " << std::sqrt(*(dot_host.data()))
+                  << ", beta = " << beta << ", alpha = " << alpha
+                  << std::endl;
+      }
     }
 
     // ==============================================================================
@@ -1158,8 +1165,32 @@ int cg_solve(VType x, OP op, VType b,
     for (int i = 0; i < nloc; i++) printf( "%d %e %e %e\n",i,p_host(i),x_host(i),r_host(i) );
     #endif
 
+    // ==============================================================================
+    // replace residual vector, check
+    if (replace_residual) {
+      // r = b - A*x
+      Kokkos::deep_copy(x_sub, x);
+      op.apply(Ax, x_global);        // Ax = A*x
+      axpby(r, one, b, -one, Ax);    // r = b-Ax
+
+      // z = z + x
+      axpby(z, one, z, one, x);
+      // x = zero
+      Kokkos::deep_copy(x, zero);
+      if (verbose && myRank == 0) {
+        std::cout << "  >> replace residual at Iteration = " << k << std::endl;
+      }
+    }
+
     num_iters = k;
   }
+
+  // ==============================================================================
+  // replace residual vector, check
+  if (replace_residual) {
+    axpby(x, one, x, one, z);    // x = x+z
+  }
+
   cudaStreamSynchronize(cudaStream[0]);
   cudaStreamSynchronize(cudaStream[1]);
   Kokkos::fence();
@@ -1307,6 +1338,8 @@ int main(int argc, char *argv[]) {
     int max_iter          = 200;
     scalar_type tolerance = 1e-8;
     std::string matrixFilename {""};
+
+    bool replace_residual = false;
 
     #if defined(CGSOLVE_ENABLE_METIS)
     bool metis       = false;
@@ -1698,6 +1731,29 @@ int main(int argc, char *argv[]) {
       axpby(b_sub, one/bnorm, c_sub, zero, b_sub);
     }
 
+    scalar_type Anorm = 0.0;
+    if (replace_residual) {
+      VType p("p", b.extent(0));
+      VType q_global("q",  n);
+      VType q_sub = Kokkos::subview(q_global, bounds);
+
+      for (int i = 0; i < 10; i++) {
+        // r = b - A*x
+        Kokkos::deep_copy(q_sub, p);
+        op.apply(p, q_global);        // p = A*p
+
+        // Anorm = norm(p)
+        dot(p, p, Anorm);
+        Anorm = std::sqrt(Anorm);
+
+        // p = p/Anorm
+        axpby(p, one/Anorm, p, zero, p);
+        if (verbose && myRank == 0) {
+          std::cout << " norm(A) = " << Anorm << std::endl;;
+        }
+      }
+    }
+
     // call CG
     if (myRank == 0) {
       int nloc = end_row - start_row;
@@ -1723,6 +1779,7 @@ int main(int argc, char *argv[]) {
                                p_sub, p,
                                n, start_row, end_row,
                                max_iter, tolerance,
+                               replace_residual, Anorm,
                                verbose, time_spmv, time_dot, time_axpy);
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
