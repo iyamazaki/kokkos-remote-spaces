@@ -79,7 +79,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 using         memory_space = typename execution_space::memory_space;
 
 //#define USE_FLOAT
-//#define USE_MIXED_PRECISION
+#define USE_MIXED_PRECISION
 #if defined(USE_FLOAT)
  using      scalar_type = float;
 
@@ -95,6 +95,12 @@ using         memory_space = typename execution_space::memory_space;
   #define cblas_xdot          cblas_sdot
   #define cblas_xaxpy         cblas_saxpy
   #define cblas_xgemv         cblas_sgemv
+
+  using OutputCType = Kokkos::View<gram_scalar_type**>;
+  using InputAType  = Kokkos::View<     scalar_type**>;
+  using InputBType  = Kokkos::View<     scalar_type**>;
+  // unit precision GEMM with float input/output
+  template struct KokkosBlas::Impl::DotBasedGEMM<execution_space, InputAType, InputBType, OutputCType>;
  #else // mixed-precision
   using gram_scalar_type = double;
 
@@ -106,6 +112,9 @@ using         memory_space = typename execution_space::memory_space;
   using OutputCType = Kokkos::View<gram_scalar_type**>;
   using InputAType  = Kokkos::View<     scalar_type**>;
   using InputBType  = Kokkos::View<     scalar_type**>;
+  // unit precision GEMM with double input/output (input vectors are casted to double before calling GEMM)
+  template struct KokkosBlas::Impl::DotBasedGEMM<execution_space, OutputCType, OutputCType, OutputCType>;
+  // mixed precision GEMM with float input and double output
   template struct KokkosBlas::Impl::DotBasedGEMM<execution_space, InputAType, InputBType, OutputCType>;
  #endif
 #else
@@ -1551,33 +1560,24 @@ int cg_solve(VType x_out, OP op, VType b,
       #else
       // directly calling dot-based Gemm since for mixed precision, KokkosBlas::gemm ends up calling ``standard'' implementation
       #if defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
-      KokkosBlas::Impl::
-      DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device, true);
-      gemm.run(false);
-      #else
-       #if 0
-       // debug: just use dots in double
        KokkosBlas::Impl::
-       DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device);
+       DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device, true);
        gemm.run(false);
-       Kokkos::deep_copy(T_lo_device, zero);
-       #else
-       DotBasedGEMM_dd<execution_space, MType, MType, DDType> gemm(one,  V, V,
-                                                                   zero, DD_device);
+      #else
+       DotBasedGEMM_dd<execution_space, MType, MType, DDType> gemm(one,  V, V, zero, DD_device);
        gemm.run();
 
        // copying DD into T (aka MPI buffer)
        Kokkos::parallel_for(
          "copy-DD-T", 2*s+1,
          KOKKOS_LAMBDA(const int & i) {
-           for (int j = 0; j < 2*s+1; j++) {
+           for (int j = i; j < 2*s+1; j++) {
              T_device(i,j) = DD_device(i,j).val_hi;
            }
-           for (int j = 0; j < 2*s+1; j++) {
+           for (int j = i; j < 2*s+1; j++) {
              T_lo_device(i,j) = DD_device(i,j).val_lo;
            }
          });
-       #endif
       #endif // defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
       #endif
     }

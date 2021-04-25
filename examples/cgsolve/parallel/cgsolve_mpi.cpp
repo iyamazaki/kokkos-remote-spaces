@@ -50,7 +50,7 @@
 #include "KokkosKernels_IOUtils.hpp"
 
 // more detailed timer for SpMV
-//#define CGSOLVE_SPMV_TIMER
+#define CGSOLVE_SPMV_TIMER
 
 // different options for CGsolver
 #define CGSOLVE_GPU_AWARE_MPI
@@ -234,6 +234,21 @@ struct cgsolve_spmv
     Kokkos::deep_copy(idx_recvs, host_idx_recvs);
     Kokkos::deep_copy(ngb_recvs, host_ngb_recvs);
     requests_recvs = (MPI_Request*)malloc(num_neighbors_recvs * sizeof(MPI_Request));
+//#define USE_PERSISTENT_MPI
+#ifdef  USE_PERSISTENT_MPI
+    for (int q = 0; q < num_neighbors_recvs; q++) {
+      int p = host_ngb_recvs(q);
+      int start = host_ptr_recvs(q);
+      int count = host_num_recvs(p); //host_ptr_recvs(q+1)-start;
+
+      #if defined(CGSOLVE_GPU_AWARE_MPI)
+      scalar_type *buffer = buf_recvs.data();
+      MPI_Recv_init(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
+      #else
+      MPI_Recv_init(&(host_recvs(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
+      #endif
+    }
+#endif
 
     // ----------------------------------------------------------
     // find which elements to send to which process
@@ -290,6 +305,20 @@ struct cgsolve_spmv
     Kokkos::deep_copy(idx_sends, host_idx_sends);
     Kokkos::deep_copy(ngb_sends, host_ngb_sends);
     requests_sends = (MPI_Request*)malloc(num_neighbors_sends * sizeof(MPI_Request));
+#ifdef  USE_PERSISTENT_MPI
+    for (int q = 0; q < num_neighbors_sends; q++) {
+      int p = host_ngb_sends(q);
+      int start = host_ptr_sends(q);
+      int count = host_ptr_sends(q+1)-start;
+      //printf( " %d: MPI_Isend(count = %d, p = %d)\n",myRank,count,p );
+      #if !defined(CGSOLVE_GPU_AWARE_MPI)
+      MPI_Send_init(&(host_sends(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
+      #else
+      scalar_type *buffer = buf_sends.data();
+      MPI_Send_init(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
+      #endif
+    }
+#endif
 
     #if defined(KOKKOS_ENABLE_CUDA)
     setup_cusparse();
@@ -389,6 +418,9 @@ struct cgsolve_spmv
     #endif
     int num_neighbors_recvs = ngb_recvs.extent(0);
     for (int q = 0; q < num_neighbors_recvs; q++) {
+#ifdef  USE_PERSISTENT_MPI
+      MPI_Start(&requests_recvs[q]);
+#else
       int p = host_ngb_recvs(q);
       int start = host_ptr_recvs(q);
       int count = host_num_recvs(p); //host_ptr_recvs(q+1)-start;
@@ -399,6 +431,7 @@ struct cgsolve_spmv
       #else
       MPI_Irecv(&(host_recvs(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
       #endif
+#endif
     }
 
     // pack to send on device
@@ -465,6 +498,9 @@ struct cgsolve_spmv
     fence(); // synch pack
     // send on host/device
     for (int q = 0; q < num_neighbors_sends; q++) {
+#ifdef  USE_PERSISTENT_MPI
+      MPI_Start(&requests_sends[q]);
+#else
       int p = host_ngb_sends(q);
       int start = host_ptr_sends(q);
       int count = host_ptr_sends(q+1)-start;
@@ -475,6 +511,7 @@ struct cgsolve_spmv
       scalar_type *buffer = buf_sends.data();
       MPI_Isend(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #endif
+#endif
     }
 
     // wait on recv
@@ -1260,6 +1297,11 @@ int main(int argc, char *argv[]) {
   {
     int loop              = 2;
 
+    bool         strakos  = false;
+    scalar_type  strakos_l1 = 1e-3;
+    scalar_type  strakos_ln = 1e+2;
+    scalar_type  strakos_p  = 0.65;
+
     int N                 = 100;
     int nx                = 0;
     int max_iter          = 200;
@@ -1321,6 +1363,10 @@ int main(int argc, char *argv[]) {
         check = true;
         continue;
       }
+      if((strcmp(argv[i],"-strakos")==0)) {
+        strakos = true;
+        continue;
+      }
       if((strcmp(argv[i],"-sort")==0)) {
         sort_matrix = true;
         continue;
@@ -1356,7 +1402,38 @@ int main(int argc, char *argv[]) {
     HAType h_A;
     HAType h_G;
     VTypeHost h_b;
-    if (matrixFilename != "" || nx > 0) {
+    if (strakos) {
+      if (numRanks == 1) {
+        n = N;
+        nlocal = n;
+        start_row = 0;
+        end_row = n;
+        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
+          "Matrix::rowPtr", N+1);
+        Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+          "Matrix::colInd", N);
+        Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
+          "MM_Matrix::values", N);
+
+        rowPtr(0) = 0;
+        colInd(0) = 0;
+        nzVal(0)  = strakos_l1;
+        rowPtr(1) = 1;
+        for (int i = 1; i < N-1; i++) {
+          scalar_type val1 = strakos_ln - strakos_l1;
+          scalar_type val2 = ((scalar_type)(i))/((scalar_type)(N-1));
+          colInd(i) =  i;
+          nzVal (i) =  strakos_l1 + val1 * val2 * pow(strakos_p, N-(i+1));
+          rowPtr(i+1) = i+1;
+        }
+        colInd(N-1) = N-1;
+        nzVal (N-1) = strakos_ln;
+        rowPtr(N)   = N;
+        h_A = HAType (rowPtr, colInd, nzVal, N);
+      }
+      h_b = VTypeHost("b_h", n);
+      Kokkos::deep_copy(h_b, one);
+    } else if (matrixFilename != "" || nx > 0) {
       scalar_type *values;
       int         *col_idx;
       int         *row_ptr;
@@ -1607,6 +1684,19 @@ int main(int argc, char *argv[]) {
 
     // local sol on device
     VType x_sub("x", b_sub.extent(0));
+    if (strakos) {
+      VType x0_global("x0", n);
+      VType c_sub("c", b_sub.extent(0));
+
+      Kokkos::deep_copy(x0_global, one);
+      op.apply(c_sub, x0_global);
+
+      scalar_type bnorm = 0.0;
+      dot(c_sub, c_sub, bnorm);
+      bnorm = std::sqrt(bnorm);
+
+      axpby(b_sub, one/bnorm, c_sub, zero, b_sub);
+    }
 
     // call CG
     if (myRank == 0) {

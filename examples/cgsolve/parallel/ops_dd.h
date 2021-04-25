@@ -45,7 +45,7 @@ double dd_quick_two_sum(volatile double a, volatile double b, volatile double &e
   return s;
 }
 
-//#define IEEE_754
+#define IEEE_754
 #ifdef  IEEE_754
 inline __host__ __device__
 void dd_add(const volatile double &a_hi, const volatile double &a_lo,

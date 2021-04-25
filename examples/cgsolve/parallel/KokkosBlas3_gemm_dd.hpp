@@ -268,8 +268,8 @@ struct DotBasedGEMM_dd{
     ReduceDD::dd_sum result;
     Kokkos::parallel_reduce(Kokkos::TeamThreadRange(teamMember, chunkSize), [&](const size_type k, ReduceDD::dd_sum &update) {
         if(baseInd + k < dotSize) {
-          double a = alpha * A(baseInd+k, rowId);
-          double b =         B(baseInd+k, colId);
+          double a = A(baseInd+k, rowId); //alpha * A(baseInd+k, rowId);
+          double b = B(baseInd+k, colId); //        B(baseInd+k, colId);
           #if 0
            update.val_hi += alpha * A(baseInd+k, rowId) * B(baseInd+k, colId);
           #else
