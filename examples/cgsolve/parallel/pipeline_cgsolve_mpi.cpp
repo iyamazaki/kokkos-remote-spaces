@@ -1375,6 +1375,11 @@ int main(int argc, char *argv[]) {
   {
     int loop         = 1;
 
+    bool    strakos  = false;
+    double  strakos_l1 = 1e-3;
+    double  strakos_ln = 1e+2;
+    double  strakos_p  = 0.65;
+
     int N            = 100;
     int nx           = 0;
     int max_iter     = 200;
@@ -1453,12 +1458,10 @@ int main(int argc, char *argv[]) {
         sort_matrix = true;
         continue;
       }
-      #if defined(CGSOLVE_ENABLE_METIS)
       if((strcmp(argv[i],"-metis")==0)) {
         metis = true;
         continue;
       }
-      #endif
     }
 
     using default_execution_space = Kokkos::DefaultExecutionSpace;
@@ -1482,210 +1485,28 @@ int main(int argc, char *argv[]) {
     int end_row = 0;
 
     HAType h_A;
-    HAType h_G;
     VTypeHost h_b;
-    if (matrixFilename != "" || nx > 0) {
-      double  *values;
-      int *col_idx;
-      int *row_ptr;
-      int nnz = 0;
-      if (matrixFilename != "") {
-        KokkosKernels::Impl::read_matrix<int, int, double>(
-          &n, &nnz, &row_ptr, &col_idx, &values, matrixFilename.c_str());
-      } else if (nx > 0) {
-        h_G = Impl::generate_Laplace_matrix(nx, nx, nx);
-        values = h_G.values.data();
-        col_idx = h_G.col_idx.data();
-        row_ptr = h_G.row_ptr.data();
-        n = nx * nx *nx;
-        nnz = row_ptr[n];
-      }
-
-      if (numRanks == 1) {
-        // skip partitioning
-        nlocal = n;
-        start_row = 0;
-        end_row = n;
-        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
-          row_ptr, n+1);
-        Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
-          col_idx, nnz);
-        Kokkos::View<double *, Kokkos::HostSpace> nzVal(
-          values, nnz);
-        h_A = HAType (rowPtr, colInd, nzVal, n);
-      } else {
-        // partition
-        #if defined(CGSOLVE_ENABLE_METIS)
-        if (metis) {
-          int *parts = new int[n];
-          if (myRank == 0) {
-            idx_t n_metis = n;
-            idx_t nnz = row_ptr[n];
-
-            // remove diagonal elements (and casting to METIS idx_t)
-            idx_t *metis_rowptr = new idx_t[n+1];
-            idx_t *metis_colind = new idx_t[nnz];
-
-            nnz = 0;
-            metis_rowptr[0] = 0;
-            for (int i = 0; i < n; i++) {
-              for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
-                if (col_idx[k] != i) {
-                  metis_colind[nnz] = col_idx[k];
-                  nnz ++;
-                }
-              }
-              metis_rowptr[i+1] = nnz;
-            }
-
-            // call METIS
-            idx_t ncon = 1;
-            idx_t nparts = numRanks;
-            idx_t objval = 0;
-            idx_t *metis_perm = new idx_t[n];
-            idx_t *metis_part = new idx_t[n];
-            std::cout << "  + calling METIS_PartGraphKway: (n=" << n << ", nnz/n=" << float(nnz)/float(n) << ") " << std::endl;
-            if (METIS_OK != METIS_PartGraphKway(&n_metis, &ncon, metis_rowptr, metis_colind,
-                                                NULL, NULL, NULL, &nparts, NULL, NULL, NULL,
-                                                &objval, metis_part)) {
-              std::cout << std::endl << "METIS_NodeND failed" << std::endl << std::endl;
-            }
-
-            for (idx_t i = 0; i < n; i++) {
-              parts[i] = metis_part[i];
-            }
-
-            delete [] metis_part;
-            delete [] metis_rowptr;
-            delete [] metis_colind;
-          }
-          // bcast partition and form perm/iperm
-          MPI_Bcast(parts, n, MPI_INT, 0, MPI_COMM_WORLD);
-          int *perm = new int[n];
-          int *iperm = new int[n];
-          int *part_ptr = new int[numRanks + 1];
-          // part_ptr points to the begining of each part after ND
-          for (int p = 0; p <= numRanks; p++) {
-            part_ptr[p] = 0;
-          }
-          for (int p = 0; p < n; p++) {
-            part_ptr[1+parts[p]] ++;
-          }
-          // part_map maps row id to part id after ND
-          part_map = new int[n];
-          for (int p = 0; p < numRanks; p++) {
-            part_ptr[p+1] += part_ptr[p];
-            for (int i = part_ptr[p]; i < part_ptr[p+1]; i++) {
-              part_map[i] = p;
-            }
-          }
-          // form perm/iperm
-          int nnzlocal = 0;
-          for (int i = 0; i < n; i++) {
-            int p = parts[i];
-            perm[part_ptr[p]] = i;
-            iperm[i] = part_ptr[p];
-
-            nnzlocal += (row_ptr[i+1] - row_ptr[i]);
-            part_ptr[p] ++;
-          }
-          for (int p = numRanks; p > 0; p--) {
-            part_ptr[p] = part_ptr[p-1];
-          }
-          part_ptr[0] = 0;
-          /*if (myRank == 0) {
-            //for (int i = 0; i < n; i++) printf( " perm[%d]=%d iperm[%d]=%d, map[%d]=%d\n",i,perm[i],i,iperm[i],i,part_map[i]);
-            for (int i = 0; i < n; i++) printf( " %d %d %d\n",i,perm[i],iperm[i]);
-          }*/
-
-          // form permuted local matrix
-          start_row = part_ptr[myRank];
-          end_row = part_ptr[myRank+1];
-          Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
-            "Matrix::rowPtr", (end_row - start_row)+1);
-          Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
-            "Matrix::colInd", nnzlocal);
-          Kokkos::View<double *, Kokkos::HostSpace> nzVal(
-            "MM_Matrix::values", nnzlocal);
-
-          nnzlocal = 0;
-          rowPtr(0) = 0;
-          for (int id = start_row; id < end_row; id++) {
-            int i = perm[id];
-            for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
-              colInd(nnzlocal) = iperm[col_idx[k]];
-              nzVal(nnzlocal) =  values[k];
-              nnzlocal ++;
-            }
-            rowPtr(id-start_row+1) = nnzlocal;
-          }
-          h_A = HAType (rowPtr, colInd, nzVal, end_row - start_row);
-        } else
-        #endif
-        {
-          if (myRank == 0) {
-            std::cout << "  + using regular 1D partition of matrix : (n=" << n << ", nnz=" << nnz << ") " << std::endl;
-          }
-          nlocal = (n + numRanks - 1) / numRanks;
-          start_row = myRank * nlocal;
-          end_row = (myRank + 1) * nlocal;
-          if (end_row > n)
-          end_row = n;
-
-          int nnzlocal = row_ptr[end_row] - row_ptr[start_row];
-          Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
-            "Matrix::rowPtr", (end_row - start_row)+1);
-          Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
-            "Matrix::colInd", nnzlocal);
-          Kokkos::View<double *, Kokkos::HostSpace> nzVal(
-            "MM_Matrix::values", nnzlocal);
-
-          nnzlocal = 0;
-          rowPtr(0) = 0;
-          for (int i = start_row; i < end_row; i++) {
-            for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
-              colInd(nnzlocal) =  col_idx[k];
-              nzVal(nnzlocal) =  values[k];
-              nnzlocal ++;
-            }
-            rowPtr(i-start_row+1) = nnzlocal;
-          }
-          h_A = HAType (rowPtr, colInd, nzVal, end_row - start_row);
-        }
-      }
-      h_b = VTypeHost("b_h", n);
-      Kokkos::deep_copy(h_b, one);
-    } else {
-      h_A = Impl::generate_miniFE_matrix(N);
-      // generate rhs
-      h_b = Impl::generate_miniFE_vector(N);
-
-      // global/local dimension
-      n = h_b.extent(0);
-      nlocal = (n + numRanks - 1) / numRanks;
-      start_row = myRank * nlocal;
-      end_row = (myRank + 1) * nlocal;
-      if (end_row > n)
-        end_row = n;
-
-      // resize rowptr
-      Kokkos::resize(h_A.row_ptr, (end_row - start_row)+1);
-
-      // convert the column indexes to "standard" global indexes
-      for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
-        for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
-          int p = h_A.col_idx(k) / MASK;
-          int idx = h_A.col_idx(k) % MASK;
-          int start_row = p * nlocal;
-          h_A.col_idx(k) = start_row + idx;
-        }
-      }
+    {
+      h_A = Impl::generate_matrix<double>(strakos, strakos_l1, strakos_ln, strakos_p,
+                                          matrixFilename, nx, N, metis, verbose);
+      n         = h_A.num_cols();
+      nlocal    = h_A.nlocal;
+      start_row = h_A.start_row;
+      end_row   = h_A.end_row;
     }
     if (sort_matrix) {
       if (myRank == 0) {
         std::cout << "  + sorting matrix .." << std::endl;
       }
       Impl::sort_matrix(h_A);
+    }
+
+    // generate right-hand-side
+    if (strakos || matrixFilename != "" || nx > 0) {
+      h_b = VTypeHost("b_h", n);
+      Kokkos::deep_copy(h_b, one);
+    } else {
+      h_b = Impl::generate_miniFE_vector<double>(N);
     }
 
     // copy the matrix to device

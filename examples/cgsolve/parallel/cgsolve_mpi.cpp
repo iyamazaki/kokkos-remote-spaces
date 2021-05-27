@@ -47,10 +47,8 @@
 #include <generate_matrix.hpp>
 #include <mpi.h>
 
-#include "KokkosKernels_IOUtils.hpp"
-
 // more detailed timer for SpMV
-#define CGSOLVE_SPMV_TIMER
+//#define CGSOLVE_SPMV_TIMER
 
 // different options for CGsolver
 #define CGSOLVE_GPU_AWARE_MPI
@@ -75,7 +73,8 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using memory_space = typename execution_space::memory_space;
 
-#if 1
+//#define USE_FLOAT
+#if defined(USE_FLOAT)
  using scalar_type = float;
 
  #define MPI_SCALAR        MPI_FLOAT
@@ -83,8 +82,16 @@ using memory_space = typename execution_space::memory_space;
  #define cublasXaxpy       cublasSaxpy
  #define cublasXscal       cublasSscal
  #define cublasXdot        cublasSdot
+
+ //#define USE_MIXED_PRECISION
+ #if defined(USE_MIXED_PRECISION)
+  using solution_type = double;
+ #else
+  using solution_type = float;
+ #endif
 #else
  using scalar_type = double;
+ using solution_type = double;
 
  #define MPI_SCALAR        MPI_DOUBLE
  #define cusparseXcsrmv    cusparseDcsrmv
@@ -102,7 +109,8 @@ struct cgsolve_spmv
   using   host_integer_view_t = Kokkos::View<int *, Kokkos::HostSpace>;
   using mirror_integer_view_t = typename integer_view_t::HostMirror;
 
-  using  buffer_view_t = Kokkos::View<scalar_type *>;
+  using  value_type = typename HAType::value_type;
+  using  buffer_view_t = Kokkos::View<value_type *>;
 
   using team_policy_type  = Kokkos::TeamPolicy<SpaceType>;
   using member_type       = typename team_policy_type::member_type;
@@ -137,7 +145,7 @@ struct cgsolve_spmv
 
     // ----------------------------------------------------------
     // find which elements to receive from which process
-    const scalar_type zero (0.0);
+    const value_type zero (0.0);
 
     num_recvs = integer_view_t("num_recvs", numRanks);
     host_num_recvs = Kokkos::create_mirror_view(num_recvs);
@@ -242,7 +250,7 @@ struct cgsolve_spmv
       int count = host_num_recvs(p); //host_ptr_recvs(q+1)-start;
 
       #if defined(CGSOLVE_GPU_AWARE_MPI)
-      scalar_type *buffer = buf_recvs.data();
+      value_type *buffer = buf_recvs.data();
       MPI_Recv_init(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
       #else
       MPI_Recv_init(&(host_recvs(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
@@ -314,7 +322,7 @@ struct cgsolve_spmv
       #if !defined(CGSOLVE_GPU_AWARE_MPI)
       MPI_Send_init(&(host_sends(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #else
-      scalar_type *buffer = buf_sends.data();
+      value_type *buffer = buf_sends.data();
       MPI_Send_init(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #endif
     }
@@ -426,7 +434,7 @@ struct cgsolve_spmv
       int count = host_num_recvs(p); //host_ptr_recvs(q+1)-start;
 
       #if defined(CGSOLVE_GPU_AWARE_MPI)
-      scalar_type *buffer = buf_recvs.data();
+      value_type *buffer = buf_recvs.data();
       MPI_Irecv(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
       #else
       MPI_Irecv(&(host_recvs(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_recvs[q]);
@@ -508,7 +516,7 @@ struct cgsolve_spmv
       #if !defined(CGSOLVE_GPU_AWARE_MPI)
       MPI_Isend(&(host_sends(start)), count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #else
-      scalar_type *buffer = buf_sends.data();
+      value_type *buffer = buf_sends.data();
       MPI_Isend(&buffer[start], count, MPI_SCALAR, p, 0, MPI_COMM_WORLD, &requests_sends[q]);
       #endif
 #endif
@@ -595,8 +603,8 @@ struct cgsolve_spmv
      int numCols = n;
      int numRows = h_A.row_ptr.extent(0)-1;
      int nnz = h_A.row_ptr(numRows);
-     scalar_type alpha (1.0);
-     scalar_type beta  (0.0);
+     value_type alpha (1.0);
+     value_type beta  (0.0);
      cusparseXcsrmv(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
                     numRows, numCols, nnz,
                     &alpha, descrA,
@@ -634,10 +642,10 @@ struct cgsolve_spmv
               const int row_start = A.row_ptr(row);
               const int row_length = A.row_ptr(row + 1) - row_start;
 
-              scalar_type y_row = 0.0;
+              value_type y_row = 0.0;
               Kokkos::parallel_reduce(
                   Kokkos::ThreadVectorRange(team, row_length),
-                  [=](const int i, scalar_type &sum) {
+                  [=](const int i, value_type &sum) {
                     int idx = A.col_idx(i + row_start);
                     sum += A.values(i + row_start) * x(idx);
                   },
@@ -670,6 +678,25 @@ struct cgsolve_spmv
       fence();
       time_spmv = timer.seconds();
     }
+  }
+
+  // -------------------------------------------------------------
+  // print
+  void print() {
+    auto  values_host = Kokkos::create_mirror_view(A.values);
+    auto  rowptr_host = Kokkos::create_mirror_view(A.row_ptr);
+    auto  colind_host = Kokkos::create_mirror_view(A.col_idx);
+    Kokkos::deep_copy(values_host, A.values);
+    Kokkos::deep_copy(rowptr_host, A.row_ptr);
+    Kokkos::deep_copy(colind_host, A.col_idx);
+
+    printf( "A=[\n" );
+    for (int i = 0; i < nlocal; i++) {
+      for (int k = (int)rowptr_host(i); k < (int)rowptr_host(i+1); k++) {
+        printf( "%d %d %e\n",i,colind_host(k),values_host(k) );
+      }
+    }
+    printf("];\n");
   }
 
   double time_comm;
@@ -877,15 +904,16 @@ void axpby(ZType z1, XType x1, scalar_type beta1, YType y1,
 
 // =============================================================
 // cg_solve
-template <class VType, class OP>
-int cg_solve(VType x, OP op, VType b,
-             VType p, VType p_global,
+template <class VType, class OP1, class OP2>
+int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
              int n, int start_row, int end_row,
              int max_iter, scalar_type tolerance,
              bool replace_residual, int replace_op, int maxNnzA, scalar_type norma,
              bool verbose, bool time_spmv_on, bool time_dot_on, bool time_axpy_on) {
 
-  using DView = Kokkos::View<scalar_type*>;
+  using value_type1 = typename OP1::value_type; // working precision
+  using value_type2 = typename OP2::value_type; // inner lower precision
+  using VType2 = Kokkos::View<value_type2 *>;
 
   int myRank, numRanks;
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
@@ -922,42 +950,47 @@ int cg_solve(VType x, OP op, VType b,
   double time_axpby = 0.0;
   double flop_axpby = 0.0;
 
-  scalar_type normr = 0.0;
-  scalar_type alpha = 0.0;
-  scalar_type beta = 0.0;
-  scalar_type old_rr = 0.0;
-  scalar_type new_rr = 0.0;
-  scalar_type pAp = 0.0;
-  Kokkos::View<scalar_type> dot_result("dot_result"); 
+  value_type2 normr = 0.0;
+  value_type2 alpha = 0.0;
+  value_type2 beta = 0.0;
+  value_type2 old_rr = 0.0;
+  value_type2 new_rr = 0.0;
+  value_type2 pAp = 0.0;
+  Kokkos::View<value_type2> dot_result("dot_result"); 
   auto dot_host = Kokkos::create_mirror_view(dot_result);
+
+  // input vector for SpMV
+  Kokkos::pair<int, int> bounds(start_row, end_row);
+  VType2 p_global("p", n); // global
+  VType2 p = Kokkos::subview(p_global, bounds); // local
 
   // residual vector
   int nloc = x.extent(0);
-  VType  r("r",  nloc);
-  VType Ap("Ap", nloc);
+  VType2  r("r",  nloc);
+  VType2 Ap("Ap", nloc);
   //#define KOKKOS_DEBUG_CGSOLVER
   #if defined(KOKKOS_DEBUG_CGSOLVER)
   auto  x_host = Kokkos::create_mirror_view(x);
+  auto  b_host = Kokkos::create_mirror_view(b);
   auto  r_host = Kokkos::create_mirror_view(r);
   auto  p_host = Kokkos::create_mirror_view(p);
   auto Ap_host = Kokkos::create_mirror_view(Ap);
   #endif
 
   // for residual replacement
-  const auto eps = std::numeric_limits<scalar_type>::epsilon();
-  const scalar_type replace_tol = std::sqrt(eps);
-  scalar_type normx = 0.0;
-  scalar_type d_replace = 0.0;
-  scalar_type normr_prev = 0.0;
-  scalar_type d_replace_prev = 0.0;
-  scalar_type sum_x = 0.0;
-  scalar_type sum_r = 0.0;
+  const auto eps = std::numeric_limits<value_type2>::epsilon();
+  const value_type2 replace_tol = std::sqrt(eps);
+  value_type2 normx = 0.0;
+  value_type2 d_replace = 0.0;
+  value_type2 normr_prev = 0.0;
+  value_type2 d_replace_prev = 0.0;
+  value_type2 sum_x = 0.0;
+  value_type2 sum_r = 0.0;
   VType z("z",  nloc); // store "group" update
   VType w("w",  nloc); // workspace for computing explicit residual norm (w = x + z)
   Kokkos::deep_copy(z, zero);
 
   // to compute true-residual with verbose on
-  Kokkos::pair<int, int> bounds(start_row, end_row);
   VType r_true  ("true_r",  nloc);
   VType Ax      ("Ax", nloc);
   VType x_global("true_r",  n);
@@ -987,13 +1020,18 @@ int cg_solve(VType x, OP op, VType b,
 
   // ==============================================================================
   // r = b - A*x
-  axpby(p, zero, x, one, x);   // p = x
-  op.apply(Ap, p_global);      // Ap = A*p
-  axpby(r, one, b, -one, Ap);  // r = b-Ap
+  axpby(p, zero, x, one, x);    // p = x
+  op2.apply(Ap, p_global);      // Ap = A*p
+  axpby(r, one, b, -one, Ap);   // r = b-Ap
 
-  //printf("Init: x, Ax, b, r\n" );
-  //Kokkos::fence();
-  //for (int i=0; i<b.extent(0); i++) printf(" %e, %e, %e, %e\n",x(i),AAr(i),b(i),r(i));
+  #if defined(KOKKOS_DEBUG_CGSOLVER)
+  printf("Init: x, Ax, b, r\n" );
+  Kokkos::deep_copy( x_host, x);
+  Kokkos::deep_copy( b_host, b);
+  Kokkos::deep_copy( r_host, r);
+  Kokkos::deep_copy(Ap_host, Ap);
+  for (int i=0; i<b.extent(0); i++) printf(" %e, %e, %e, %e\n",x_host(i),Ap_host(i),b_host(i),r_host(i));
+  #endif
 
   // beta = r'*r (using Kokkos and non Cuda-aware MPI)
   dot(r, dot_result);
@@ -1088,20 +1126,26 @@ int cg_solve(VType x, OP op, VType b,
     if (time_spmv_on) {
       timer_spmv.reset();
     }
-    op.apply(Ap, p_global);
+    op2.apply(Ap, p_global);
+    #if defined(KOKKOS_DEBUG_CGSOLVER)
+    printf(" %d: p, Ap\n", k);
+    Kokkos::deep_copy( p_host, p);
+    Kokkos::deep_copy(Ap_host, Ap);
+    for (int i=0; i<b.extent(0); i++) printf(" %e, %e\n",p_host(i),Ap_host(i));
+    #endif
 
     if (time_spmv_on) {
       Kokkos::fence();
       time_spmv += timer_spmv.seconds();
-      time_spmv_comm   += op.time_comm;
-      time_spmv_spmv   += op.time_spmv;
+      time_spmv_comm   += op2.time_comm;
+      time_spmv_spmv   += op2.time_spmv;
       #if defined(CGSOLVE_SPMV_TIMER)
-      time_spmv_copy   += op.time_comm_copy;
-      time_spmv_pack   += op.time_comm_pack;
-      time_spmv_unpack += op.time_comm_unpack;
-      time_spmv_mpi    += op.time_comm_mpi;
-      time_spmv_wait_send += op.time_comm_wait_send;
-      time_spmv_wait_recv += op.time_comm_wait_recv;
+      time_spmv_copy   += op2.time_comm_copy;
+      time_spmv_pack   += op2.time_comm_pack;
+      time_spmv_unpack += op2.time_comm_unpack;
+      time_spmv_mpi    += op2.time_comm_mpi;
+      time_spmv_wait_send += op2.time_comm_wait_send;
+      time_spmv_wait_recv += op2.time_comm_wait_recv;
       #endif
     }
 
@@ -1140,8 +1184,8 @@ int cg_solve(VType x, OP op, VType b,
       } else {
         Kokkos::deep_copy(x_sub, x);
       }
-      op.apply(Ax, x_global);           // Ax = A*x
-      axpby(r_true, one, b, -one, Ax);  // r = b-Ax
+      op1.apply(Ax, x_global);           // Ax = A*x
+      axpby(r_true, one, b, -one, Ax);   // r = b-Ax
 
       // explicit residual norm
       dot(r_true, r_true, dot_result);
@@ -1214,8 +1258,11 @@ int cg_solve(VType x, OP op, VType b,
 
         // r = b - A*z
         Kokkos::deep_copy(x_sub, z);
-        op.apply(Ax, x_global);        // Ax = A*x
-        axpby(r, one, b, -one, Ax);    // r = b-Ax
+        op1.apply(Ax, x_global);          // Ax = A*x
+        axpby(r_true, one, b, -one, Ax);  // r = b-Ax
+
+        // cast-copy to inner r
+        axpby(r, one, r_true, zero, r_true); //
 
         // x = zero
         Kokkos::deep_copy(x, zero);
@@ -1361,6 +1408,18 @@ int cg_solve(VType x, OP op, VType b,
 }
 
 
+// cg_solve (unit precision)
+template <class VType, class OP>
+int cg_solve(VType x, VType b, OP op,
+             int n, int start_row, int end_row,
+             int max_iter, scalar_type tolerance,
+             bool replace_residual, int replace_op, int maxNnzA, scalar_type norma,
+             bool verbose, bool time_spmv_on, bool time_dot_on, bool time_axpy_on) {
+
+  return cg_solve(x, b, op, op, n, start_row, end_row,
+                  max_iter, tolerance, replace_residual, replace_op, maxNnzA, norma,
+                  verbose, time_spmv_on, time_dot_on, time_axpy_on);
+}
 
 // =============================================================
 int main(int argc, char *argv[]) {
@@ -1370,11 +1429,11 @@ int main(int argc, char *argv[]) {
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
   MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
-  using  VType = Kokkos::View<scalar_type *>;
-  using  AType = CrsMatrix<memory_space, scalar_type>;
-  using HAType = CrsMatrix<host_execution_space, scalar_type>;
+  using  VType = Kokkos::View<solution_type *>;
+  using  AType = CrsMatrix<memory_space, solution_type>;
+  using HAType = CrsMatrix<host_execution_space, solution_type>;
 
-  using VTypeHost = Kokkos::View<scalar_type *, Kokkos::HostSpace>;
+  using VTypeHost = Kokkos::View<solution_type *, Kokkos::HostSpace>;
 
   Kokkos::initialize(argc, argv);
   {
@@ -1394,9 +1453,7 @@ int main(int argc, char *argv[]) {
     int replace_op = 0; // 0: replace at every step
     bool replace_residual = false;
 
-    #if defined(CGSOLVE_ENABLE_METIS)
     bool metis       = false;
-    #endif
     bool sort_matrix = false;
     bool verbose     = false;
     bool time_dot    = false;
@@ -1465,12 +1522,10 @@ int main(int argc, char *argv[]) {
         sort_matrix = true;
         continue;
       }
-      #if defined(CGSOLVE_ENABLE_METIS)
       if((strcmp(argv[i],"-metis")==0)) {
         metis = true;
         continue;
       }
-      #endif
     }
 
     using default_execution_space = Kokkos::DefaultExecutionSpace;
@@ -1494,241 +1549,28 @@ int main(int argc, char *argv[]) {
     int end_row = 0;
 
     HAType h_A;
-    HAType h_G;
     VTypeHost h_b;
-    if (strakos) {
-      if (numRanks == 1) {
-        n = N;
-        nlocal = n;
-        start_row = 0;
-        end_row = n;
-        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
-          "Matrix::rowPtr", N+1);
-        Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
-          "Matrix::colInd", N);
-        Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
-          "MM_Matrix::values", N);
-
-        rowPtr(0) = 0;
-        colInd(0) = 0;
-        nzVal(0)  = strakos_l1;
-        rowPtr(1) = 1;
-        for (int i = 1; i < N-1; i++) {
-          scalar_type val1 = strakos_ln - strakos_l1;
-          scalar_type val2 = ((scalar_type)(i))/((scalar_type)(N-1));
-          colInd(i) =  i;
-          nzVal (i) =  strakos_l1 + val1 * val2 * pow(strakos_p, N-(i+1));
-          rowPtr(i+1) = i+1;
-        }
-        colInd(N-1) = N-1;
-        nzVal (N-1) = strakos_ln;
-        rowPtr(N)   = N;
-        h_A = HAType (rowPtr, colInd, nzVal, N);
-      }
-      h_b = VTypeHost("b_h", n);
-      Kokkos::deep_copy(h_b, one);
-    } else if (matrixFilename != "" || nx > 0) {
-      scalar_type *values;
-      int         *col_idx;
-      int         *row_ptr;
-      int nnz = 0;
-      if (matrixFilename != "") {
-        KokkosKernels::Impl::read_matrix<int, int, scalar_type>(
-          &n, &nnz, &row_ptr, &col_idx, &values, matrixFilename.c_str());
-      } else if (nx > 0) {
-        h_G = Impl::generate_Laplace_matrix<scalar_type>(nx, nx, nx);
-        values = h_G.values.data();
-        col_idx = h_G.col_idx.data();
-        row_ptr = h_G.row_ptr.data();
-        n = nx * nx *nx;
-        nnz = row_ptr[n];
-      }
-
-      if (numRanks == 1) {
-        // skip partitioning
-        nlocal = n;
-        start_row = 0;
-        end_row = n;
-        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
-          row_ptr, n+1);
-        Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
-          col_idx, nnz);
-        Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
-          values, nnz);
-        h_A = HAType (rowPtr, colInd, nzVal, n);
-      } else {
-        // partition
-        #if defined(CGSOLVE_ENABLE_METIS)
-        if (metis) {
-          int *parts = new int[n];
-          if (myRank == 0) {
-            idx_t n_metis = n;
-            idx_t nnz = row_ptr[n];
-
-            // remove diagonal elements (and casting to METIS idx_t)
-            idx_t *metis_rowptr = new idx_t[n+1];
-            idx_t *metis_colind = new idx_t[nnz];
-
-            nnz = 0;
-            metis_rowptr[0] = 0;
-            for (int i = 0; i < n; i++) {
-              for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
-                if (col_idx[k] != i) {
-                  metis_colind[nnz] = col_idx[k];
-                  nnz ++;
-                }
-              }
-              metis_rowptr[i+1] = nnz;
-            }
-
-            // call METIS
-            idx_t ncon = 1;
-            idx_t nparts = numRanks;
-            idx_t objval = 0;
-            idx_t *metis_perm = new idx_t[n];
-            idx_t *metis_part = new idx_t[n];
-            std::cout << "  + calling METIS_PartGraphKway: (n=" << n << ", nnz/n=" << float(nnz)/float(n) << ") " << std::endl;
-            if (METIS_OK != METIS_PartGraphKway(&n_metis, &ncon, metis_rowptr, metis_colind,
-                                                NULL, NULL, NULL, &nparts, NULL, NULL, NULL,
-                                                &objval, metis_part)) {
-              std::cout << std::endl << "METIS_NodeND failed" << std::endl << std::endl;
-            }
-
-            for (idx_t i = 0; i < n; i++) {
-              parts[i] = metis_part[i];
-            }
-
-            delete [] metis_part;
-            delete [] metis_rowptr;
-            delete [] metis_colind;
-          }
-          // bcast partition and form perm/iperm
-          MPI_Bcast(parts, n, MPI_INT, 0, MPI_COMM_WORLD);
-          int *perm = new int[n];
-          int *iperm = new int[n];
-          int *part_ptr = new int[numRanks + 1];
-          // part_ptr points to the begining of each part after ND
-          for (int p = 0; p <= numRanks; p++) {
-            part_ptr[p] = 0;
-          }
-          for (int p = 0; p < n; p++) {
-            part_ptr[1+parts[p]] ++;
-          }
-          // part_map maps row id to part id after ND
-          part_map = new int[n];
-          for (int p = 0; p < numRanks; p++) {
-            part_ptr[p+1] += part_ptr[p];
-            for (int i = part_ptr[p]; i < part_ptr[p+1]; i++) {
-              part_map[i] = p;
-            }
-          }
-          // form perm/iperm
-          int nnzlocal = 0;
-          for (int i = 0; i < n; i++) {
-            int p = parts[i];
-            perm[part_ptr[p]] = i;
-            iperm[i] = part_ptr[p];
-
-            nnzlocal += (row_ptr[i+1] - row_ptr[i]);
-            part_ptr[p] ++;
-          }
-          for (int p = numRanks; p > 0; p--) {
-            part_ptr[p] = part_ptr[p-1];
-          }
-          part_ptr[0] = 0;
-          /*if (myRank == 0) {
-            //for (int i = 0; i < n; i++) printf( " perm[%d]=%d iperm[%d]=%d, map[%d]=%d\n",i,perm[i],i,iperm[i],i,part_map[i]);
-            for (int i = 0; i < n; i++) printf( " %d %d %d\n",i,perm[i],iperm[i]);
-          }*/
-
-          // form permuted local matrix
-          start_row = part_ptr[myRank];
-          end_row = part_ptr[myRank+1];
-          Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
-            "Matrix::rowPtr", (end_row - start_row)+1);
-          Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
-            "Matrix::colInd", nnzlocal);
-          Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
-            "MM_Matrix::values", nnzlocal);
-
-          nnzlocal = 0;
-          rowPtr(0) = 0;
-          for (int id = start_row; id < end_row; id++) {
-            int i = perm[id];
-            for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
-              colInd(nnzlocal) = iperm[col_idx[k]];
-              nzVal(nnzlocal) =  values[k];
-              nnzlocal ++;
-            }
-            rowPtr(id-start_row+1) = nnzlocal;
-          }
-          h_A = HAType (rowPtr, colInd, nzVal, end_row - start_row);
-        } else
-        #endif
-        {
-          if (myRank == 0) {
-            std::cout << "  + using regular 1D partition of matrix : (n=" << n << ", nnz=" << nnz << ") " << std::endl;
-          }
-          nlocal = (n + numRanks - 1) / numRanks;
-          start_row = myRank * nlocal;
-          end_row = (myRank + 1) * nlocal;
-          if (end_row > n)
-          end_row = n;
-
-          int nnzlocal = row_ptr[end_row] - row_ptr[start_row];
-          Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
-            "Matrix::rowPtr", (end_row - start_row)+1);
-          Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
-            "Matrix::colInd", nnzlocal);
-          Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
-            "MM_Matrix::values", nnzlocal);
-
-          nnzlocal = 0;
-          rowPtr(0) = 0;
-          for (int i = start_row; i < end_row; i++) {
-            for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
-              colInd(nnzlocal) =  col_idx[k];
-              nzVal(nnzlocal) =  values[k];
-              nnzlocal ++;
-            }
-            rowPtr(i-start_row+1) = nnzlocal;
-          }
-          h_A = HAType (rowPtr, colInd, nzVal, end_row - start_row);
-        }
-      }
-      h_b = VTypeHost("b_h", n);
-      Kokkos::deep_copy(h_b, one);
-    } else {
-      h_A = Impl::generate_miniFE_matrix<scalar_type>(N);
-      // generate rhs
-      h_b = Impl::generate_miniFE_vector<scalar_type>(N);
-
-      // global/local dimension
-      n = h_b.extent(0);
-      nlocal = (n + numRanks - 1) / numRanks;
-      start_row = myRank * nlocal;
-      end_row = (myRank + 1) * nlocal;
-      if (end_row > n)
-        end_row = n;
-
-      // resize rowptr
-      Kokkos::resize(h_A.row_ptr, (end_row - start_row)+1);
-
-      // convert the column indexes to "standard" global indexes
-      for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
-        for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
-          int p = h_A.col_idx(k) / MASK;
-          int idx = h_A.col_idx(k) % MASK;
-          int start_row = p * nlocal;
-          h_A.col_idx(k) = start_row + idx;
-        }
-      }
+    {
+      h_A = Impl::generate_matrix<scalar_type>(strakos, strakos_l1, strakos_ln, strakos_p,
+                                               matrixFilename, nx, N, metis, verbose);
+      n         = h_A.num_cols();
+      nlocal    = h_A.nlocal;
+      start_row = h_A.start_row;
+      end_row   = h_A.end_row;
     }
     if (sort_matrix) {
       if (myRank == 0) {
         std::cout << "  + sorting matrix .." << std::endl;
       }
       Impl::sort_matrix(h_A);
+    }
+
+    // generate right-hand-side
+    if (strakos || matrixFilename != "" || nx > 0) {
+      h_b = VTypeHost("b_h", n);
+      Kokkos::deep_copy(h_b, one);
+    } else {
+      h_b = Impl::generate_miniFE_vector<scalar_type>(N);
     }
 
     // copy the matrix to device
@@ -1749,18 +1591,20 @@ int main(int argc, char *argv[]) {
     FILE *fp;
     sprintf(filename,"A%d_%d.dat",numRanks, myRank);
     fp = fopen(filename, "w");
+    fprintf(fp,"%d %d %d\n",n,n,h_A.row_ptr(n));
     for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
+      fprintf(fp, " > %d: %d %d\n",i,h_A.row_ptr(i),h_A.row_ptr(i+1));
       for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
-        //fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
+        fprintf(fp, "%d %d %e\n",i,h_A.col_idx(k), h_A.values(k) );
         //fprintf(fp, "%d %d\n",i,h_A.col_idx(k) );
-        printf("%d %d %e\n",i,h_A.col_idx(k),h_A.values(k) );
+        //printf("%d %d %e\n",i,h_A.col_idx(k),h_A.values(k) );
       }
     }
     fclose(fp);
     sprintf(filename,"b%d_%d.dat",numRanks, myRank);
     fp = fopen(filename, "w");
     for (int i=0; i<h_b.extent(0); i++) {
-      printf("%e\n",h_b(i));
+      fprintf(fp,"%e\n",h_b(i));
     }
     fclose(fp);*/
 
@@ -1768,13 +1612,10 @@ int main(int argc, char *argv[]) {
     Kokkos::pair<int, int> bounds(start_row, end_row);
     VType b_sub = Kokkos::subview(b, bounds);
 
-    // input vector for SpMV
-    VType p("p", n); // global
-    VType p_sub = Kokkos::subview(p, bounds); // local
-
     // setup SpMV
     cgsolve_spmv<VType, HAType, AType, VType, execution_space> op (n, h_A, A, time_spmv);
     op.setup(nlocal, part_map);
+    //op.print();
 
     // local sol on device
     VType x_sub("x", b_sub.extent(0));
@@ -1843,7 +1684,7 @@ int main(int argc, char *argv[]) {
       }
       std::cout << ", n = " << n << ", nloc = " << nloc
                 << ", nnz/nloc = " << double(nnz)/double(nloc)
-                << std::endl;
+                << " )" << std::endl;
     }
 
     for (int nloop = 0; nloop < loop; nloop++) {
@@ -1851,8 +1692,7 @@ int main(int argc, char *argv[]) {
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
       Kokkos::Timer timer;
-      int num_iters = cg_solve(x_sub, op, b_sub,
-                               p_sub, p,
+      int num_iters = cg_solve(x_sub, b_sub, op,
                                n, start_row, end_row,
                                max_iter, tolerance,
                                replace_residual, replace_op, maxNnzA, Anorm,
@@ -1861,7 +1701,10 @@ int main(int argc, char *argv[]) {
       MPI_Barrier(MPI_COMM_WORLD);
       double time = timer.seconds();
       if (check) {
+        VType p("p", n); // global
+        VType p_sub = Kokkos::subview(p, bounds); // local
         VType r("Y", x_sub.extent(0));
+
         axpby(p_sub, one, x_sub, zero, x_sub);
         op.apply(r, p);
         axpby(r, -one, r, one, b_sub);

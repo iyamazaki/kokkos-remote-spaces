@@ -48,6 +48,7 @@
 #define GENERATE_MATRIX_HPP
 
 #include <Kokkos_Core.hpp>
+#include "KokkosKernels_IOUtils.hpp"
 #include <mpi.h>
 
 #define LOCAL_ORDINAL int
@@ -55,6 +56,14 @@
 //#define MASK 1099511627776
 #define MASK 268435456
 template <class MemSpace, typename S = double> struct CrsMatrix {
+  using value_type = S;
+
+  // -------------------------------------- //
+  int nlocal;
+  int start_row;
+  int end_row;
+  // -------------------------------------- //
+
   Kokkos::View<int *, MemSpace> row_ptr;
   Kokkos::View<LOCAL_ORDINAL *, MemSpace> col_idx;
   Kokkos::View<S *, MemSpace> values;
@@ -188,6 +197,7 @@ static void miniFE_get_superblock(int *rows, S *vals, GO *cols,
 
 template <class S = double>
 static CrsMatrix<Kokkos::HostSpace, S> generate_miniFE_matrix(int nx) {
+
   int miniFE_a = 0;
   int miniFE_b = 0;
   int miniFE_c = 0;
@@ -301,19 +311,22 @@ Kokkos::View<S *, Kokkos::HostSpace> generate_miniFE_vector(int nx) {
 
 
 template <class S = double>
-static CrsMatrix<Kokkos::HostSpace, S> generate_Laplace_matrix(int nx, int ny, int nz) {
+static void generate_Laplace_matrix(int nx, int ny, int nz, int **rowPtr_out, LOCAL_ORDINAL **colInd_out, S ** nzVals_out) {
   // global dimension
   int n   = (nz > 1 ? nx * ny * nz : nx * ny);
   int nnz = (nz > 1 ? 7*n : 5*n);
-  Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
-      "generate_MiniFE_Matrix::rowPtr", n + 1);
-  Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
-      "generate_MiniFE_Matrix::colInd", nnz);
-  Kokkos::View<S *, Kokkos::HostSpace> nzVals(
-      "generate_MiniFE_Matrix::values", nnz);
+  //Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
+  //    "generate_MiniFE_Matrix::rowPtr", n + 1);
+  //Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+  //    "generate_MiniFE_Matrix::colInd", nnz);
+  //Kokkos::View<S *, Kokkos::HostSpace> nzVals(
+  //    "generate_MiniFE_Matrix::values", nnz);
+  int *rowPtr = new int[n+1];
+  LOCAL_ORDINAL *colInd = new LOCAL_ORDINAL[nnz];
+  S *nzVals = new S[nnz];
 
   nnz = 0;
-  rowPtr(0) = 0;
+  rowPtr[0] = 0;
   for (int ii = 0; ii < n; ii++) {
     S v = -1.0;
     int i, j, k, jj;
@@ -323,52 +336,55 @@ static CrsMatrix<Kokkos::HostSpace, S> generate_Laplace_matrix(int nx, int ny, i
 
     if (k > 0) {
       jj = ii - nx * ny;
-      colInd(nnz) = jj;
-      nzVals(nnz) = v;
+      colInd[nnz] = jj;
+      nzVals[nnz] = v;
       nnz++;
     }
     if (k < nz-1) {
       jj = ii + nx * ny;
-      colInd(nnz) = jj;
-      nzVals(nnz) = v;
+      colInd[nnz] = jj;
+      nzVals[nnz] = v;
       nnz++;
     }
 
     if (i > 0) {
       jj = ii - nx;
-      colInd(nnz) = jj;
-      nzVals(nnz) = v;
+      colInd[nnz] = jj;
+      nzVals[nnz] = v;
       nnz++;
     }
     if (i < ny-1) {
       jj = ii + nx;
-      colInd(nnz) = jj;
-      nzVals(nnz) = v;
+      colInd[nnz] = jj;
+      nzVals[nnz] = v;
       nnz++;
     }
 
     if (j > 0) {
       jj = ii - 1;
-      colInd(nnz) = jj;
-      nzVals(nnz) = v;
+      colInd[nnz] = jj;
+      nzVals[nnz] = v;
       nnz++;
     }
     if (j < nx-1) {
       jj = ii + 1;
-      colInd(nnz) = jj;
-      nzVals(nnz) = v;
+      colInd[nnz] = jj;
+      nzVals[nnz] = v;
       nnz++;
     }
 
     v = nz > 1 ? 6.0 : 4.0;
-    colInd(nnz) = ii;
-    nzVals(nnz) = v;
+    colInd[nnz] = ii;
+    nzVals[nnz] = v;
     nnz++;
 
-    rowPtr(ii+1) = nnz;
+    rowPtr[ii+1] = nnz;
   }
-  CrsMatrix<Kokkos::HostSpace, S> matrix(rowPtr, colInd, nzVals, n);
-  return matrix;
+  *rowPtr_out = rowPtr;
+  *colInd_out = colInd;
+  *nzVals_out = nzVals;
+  //CrsMatrix<Kokkos::HostSpace, S> matrix(rowPtr, colInd, nzVals, n);
+  //return matrix;
 }
 
 template <class S = double>
@@ -412,6 +428,268 @@ static void sort_graph(int n, int *row_ptr, int *col_idx) {
       }
     }
   }
+}
+
+
+/// ========================================================= ///
+template <class scalar_type = double>
+static CrsMatrix<Kokkos::HostSpace, scalar_type> generate_matrix(bool strakos, scalar_type strakos_l1, scalar_type strakos_ln, scalar_type  strakos_p,
+                                                                 std::string matrixFilename, int nx, int N, bool metis, bool verbose) {
+
+  using HAType = CrsMatrix<Kokkos::HostSpace, scalar_type>;
+
+  int myRank, numRanks;
+  MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
+  MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
+
+  HAType h_A;
+  if (strakos) {
+    if (numRanks == 1) {
+      h_A._num_cols = N;
+      h_A.nlocal = N;
+      h_A.start_row = 0;
+      h_A.end_row = N;
+      Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
+        "Matrix::rowPtr", N+1);
+      Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+        "Matrix::colInd", N);
+      Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
+        "MM_Matrix::values", N);
+
+      rowPtr(0) = 0;
+      colInd(0) = 0;
+      nzVal(0)  = strakos_l1;
+      rowPtr(1) = 1;
+      for (int i = 1; i < N-1; i++) {
+        scalar_type val1 = strakos_ln - strakos_l1;
+        scalar_type val2 = ((scalar_type)(i))/((scalar_type)(N-1));
+        colInd(i) =  i;
+        nzVal (i) =  strakos_l1 + val1 * val2 * pow(strakos_p, N-(i+1));
+        rowPtr(i+1) = i+1;
+      }
+      colInd(N-1) = N-1;
+      nzVal (N-1) = strakos_ln;
+      rowPtr(N)   = N;
+      h_A = HAType (rowPtr, colInd, nzVal, N);
+      if (verbose) {
+        std::cout << " generate Strakos diagonal matrix( N = " << N 
+                  << " l1 = " << strakos_l1 << " ln = " << strakos_ln << " p = " << strakos_p << " )" << std::endl;
+      }
+    }
+  } else if (matrixFilename != "" || nx > 0) {
+
+    scalar_type *values;
+    int         *col_idx;
+    int         *row_ptr;
+    int nnz = 0;
+    int n   = 0;
+    if (matrixFilename != "") {
+      KokkosKernels::Impl::read_matrix<int, int, scalar_type>(
+        &n, &nnz, &row_ptr, &col_idx, &values, matrixFilename.c_str());
+      if (verbose) {
+        std::cout << " read matrix( " << matrixFilename << " )" << std::endl;
+      }
+    } else if (nx > 0) {
+      //HAType h_G = 
+      Impl::generate_Laplace_matrix<scalar_type>(nx, nx, nx, &row_ptr, &col_idx, &values);
+      //values = h_G.values.data();
+      //col_idx = h_G.col_idx.data();
+      //row_ptr = h_G.row_ptr.data();
+      n = nx * nx *nx;
+      nnz = row_ptr[n];
+      if (verbose) {
+        std::cout << " generate Laplace 3D( nx = " << nx << " nnz = " << nnz << " )" << std::endl;
+      }
+    }
+
+    if (numRanks == 1) {
+      // skip partitioning
+      Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
+        row_ptr, n+1);
+      Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+        col_idx, nnz);
+      Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
+        values, nnz);
+      h_A = HAType (rowPtr, colInd, nzVal, n);
+      h_A.nlocal = n;
+      h_A.start_row = 0;
+      h_A.end_row = n;
+    } else {
+      // partition
+      #if defined(CGSOLVE_ENABLE_METIS)
+      if (metis) {
+        int *parts = new int[n];
+        if (myRank == 0) {
+          idx_t n_metis = n;
+          idx_t nnz = row_ptr[n];
+
+          // remove diagonal elements (and casting to METIS idx_t)
+          idx_t *metis_rowptr = new idx_t[n+1];
+          idx_t *metis_colind = new idx_t[nnz];
+
+          nnz = 0;
+          metis_rowptr[0] = 0;
+          for (int i = 0; i < n; i++) {
+            for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+              if (col_idx[k] != i) {
+                metis_colind[nnz] = col_idx[k];
+                nnz ++;
+              }
+            }
+            metis_rowptr[i+1] = nnz;
+          }
+
+          // call METIS
+          idx_t ncon = 1;
+          idx_t nparts = numRanks;
+          idx_t objval = 0;
+          idx_t *metis_perm = new idx_t[n];
+          idx_t *metis_part = new idx_t[n];
+          std::cout << "  + calling METIS_PartGraphKway: (n=" << n << ", nnz/n=" << float(nnz)/float(n) << ") " << std::endl;
+          if (METIS_OK != METIS_PartGraphKway(&n_metis, &ncon, metis_rowptr, metis_colind,
+                                              NULL, NULL, NULL, &nparts, NULL, NULL, NULL,
+                                              &objval, metis_part)) {
+            std::cout << std::endl << "METIS_NodeND failed" << std::endl << std::endl;
+          }
+
+          for (idx_t i = 0; i < n; i++) {
+            parts[i] = metis_part[i];
+          }
+
+          delete [] metis_part;
+          delete [] metis_rowptr;
+          delete [] metis_colind;
+        }
+        // bcast partition and form perm/iperm
+        MPI_Bcast(parts, n, MPI_INT, 0, MPI_COMM_WORLD);
+        int *perm = new int[n];
+        int *iperm = new int[n];
+        int *part_ptr = new int[numRanks + 1];
+        // part_ptr points to the begining of each part after ND
+        for (int p = 0; p <= numRanks; p++) {
+          part_ptr[p] = 0;
+        }
+        for (int p = 0; p < n; p++) {
+          part_ptr[1+parts[p]] ++;
+        }
+        // part_map maps row id to part id after ND
+        part_map = new int[n];
+        for (int p = 0; p < numRanks; p++) {
+          part_ptr[p+1] += part_ptr[p];
+          for (int i = part_ptr[p]; i < part_ptr[p+1]; i++) {
+            part_map[i] = p;
+          }
+        }
+        // form perm/iperm
+        int nnzlocal = 0;
+        for (int i = 0; i < n; i++) {
+          int p = parts[i];
+          perm[part_ptr[p]] = i;
+          iperm[i] = part_ptr[p];
+
+          nnzlocal += (row_ptr[i+1] - row_ptr[i]);
+          part_ptr[p] ++;
+        }
+        for (int p = numRanks; p > 0; p--) {
+          part_ptr[p] = part_ptr[p-1];
+        }
+        part_ptr[0] = 0;
+        /*if (myRank == 0) {
+          //for (int i = 0; i < n; i++) printf( " perm[%d]=%d iperm[%d]=%d, map[%d]=%d\n",i,perm[i],i,iperm[i],i,part_map[i]);
+          for (int i = 0; i < n; i++) printf( " %d %d %d\n",i,perm[i],iperm[i]);
+        }*/
+
+        // form permuted local matrix
+        int start_row = part_ptr[myRank];
+        int end_row = part_ptr[myRank+1];
+        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
+          "Matrix::rowPtr", (end_row - start_row)+1);
+        Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+          "Matrix::colInd", nnzlocal);
+        Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
+          "MM_Matrix::values", nnzlocal);
+
+        nnzlocal = 0;
+        rowPtr(0) = 0;
+        for (int id = start_row; id < end_row; id++) {
+          int i = perm[id];
+          for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+            colInd(nnzlocal) = iperm[col_idx[k]];
+            nzVal(nnzlocal) =  values[k];
+            nnzlocal ++;
+          }
+          rowPtr(id-start_row+1) = nnzlocal;
+        }
+        h_A = HAType (rowPtr, colInd, nzVal, end_row - start_row);
+        h_A.nlocal    = end_row - start_row;
+        h_A.start_row = start_row;
+        h_A.end_row   = end_row;
+      } else
+      #endif
+      {
+        if (myRank == 0) {
+          std::cout << "  + using regular 1D partition of matrix : (n=" << n << ", nnz=" << nnz << ") " << std::endl;
+        }
+        int nlocal = (n + numRanks - 1) / numRanks;
+        int start_row = myRank * nlocal;
+        int end_row = (myRank + 1) * nlocal;
+        if (end_row > n)
+          end_row = n;
+
+        int nnzlocal = row_ptr[end_row] - row_ptr[start_row];
+        Kokkos::View<int *, Kokkos::HostSpace> rowPtr(
+          "Matrix::rowPtr", (end_row - start_row)+1);
+        Kokkos::View<LOCAL_ORDINAL *, Kokkos::HostSpace> colInd(
+          "Matrix::colInd", nnzlocal);
+        Kokkos::View<scalar_type *, Kokkos::HostSpace> nzVal(
+          "MM_Matrix::values", nnzlocal);
+
+        nnzlocal = 0;
+        rowPtr(0) = 0;
+        for (int i = start_row; i < end_row; i++) {
+          for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+            colInd(nnzlocal) =  col_idx[k];
+            nzVal(nnzlocal) =  values[k];
+            nnzlocal ++;
+          }
+          rowPtr(i-start_row+1) = nnzlocal;
+        }
+        h_A = HAType (rowPtr, colInd, nzVal, end_row - start_row);
+        h_A.nlocal    = nlocal;
+        h_A.start_row = start_row;
+        h_A.end_row   = end_row;
+      }
+    }
+    h_A._num_cols = n;
+  } else {
+    // generate mini-FE matrix
+    h_A = Impl::generate_miniFE_matrix<scalar_type>(N);
+
+    // global/local dimension
+    int n = h_A.num_cols();
+    h_A.nlocal = (n + numRanks - 1) / numRanks;
+    h_A.start_row = myRank * h_A.nlocal;
+    h_A.end_row = (myRank + 1) * h_A.nlocal;
+    if (h_A.end_row > n)
+      h_A.end_row = n;
+
+    // resize rowptr
+    Kokkos::resize(h_A.row_ptr, (h_A.end_row - h_A.start_row)+1);
+
+    // convert the column indexes to "standard" global indexes
+    for (int i=0; i<h_A.row_ptr.extent(0)-1; i++) {
+      for (int k=h_A.row_ptr(i); k<h_A.row_ptr(i+1); k++) {
+        int p = h_A.col_idx(k) / MASK;
+        int idx = h_A.col_idx(k) % MASK;
+        int start_row = p * h_A.nlocal;
+        h_A.col_idx(k) = start_row + idx;
+      }
+    }
+    if (verbose) {
+      std::cout << " generate miniFE( N = " << N << " )" << std::endl;
+    }
+  }
+  return h_A;
 }
 
 } // namespace Impl
