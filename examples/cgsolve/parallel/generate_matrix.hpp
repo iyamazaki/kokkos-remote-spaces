@@ -471,7 +471,7 @@ static CrsMatrix<Kokkos::HostSpace, scalar_type> generate_matrix(bool strakos, s
       nzVal (N-1) = strakos_ln;
       rowPtr(N)   = N;
       h_A = HAType (rowPtr, colInd, nzVal, N);
-      if (verbose) {
+      if (verbose && numRanks == 1) {
         std::cout << " generate Strakos diagonal matrix( N = " << N 
                   << " l1 = " << strakos_l1 << " ln = " << strakos_ln << " p = " << strakos_p << " )" << std::endl;
       }
@@ -486,7 +486,7 @@ static CrsMatrix<Kokkos::HostSpace, scalar_type> generate_matrix(bool strakos, s
     if (matrixFilename != "") {
       KokkosKernels::Impl::read_matrix<int, int, scalar_type>(
         &n, &nnz, &row_ptr, &col_idx, &values, matrixFilename.c_str());
-      if (verbose) {
+      if (verbose && numRanks == 1) {
         std::cout << " read matrix( " << matrixFilename << " )" << std::endl;
       }
     } else if (nx > 0) {
@@ -497,7 +497,7 @@ static CrsMatrix<Kokkos::HostSpace, scalar_type> generate_matrix(bool strakos, s
       //row_ptr = h_G.row_ptr.data();
       n = nx * nx *nx;
       nnz = row_ptr[n];
-      if (verbose) {
+      if (verbose && numRanks == 1) {
         std::cout << " generate Laplace 3D( nx = " << nx << " nnz = " << nnz << " )" << std::endl;
       }
     }

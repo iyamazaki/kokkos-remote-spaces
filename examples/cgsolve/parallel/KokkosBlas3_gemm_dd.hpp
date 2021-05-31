@@ -47,6 +47,8 @@
 #ifndef KOKKOSBLAS3_GEMM_DD_HPP_
 #define KOKKOSBLAS3_GEMM_DD_HPP_
 
+namespace CgsolverDD {
+
 // DotBasedGEMM implements the optimization for C = beta*C + alpha*A^TB 
 // with A and B matrices both being tall and skinny. C matrix is assumably 
 // small, so, each entry of C is computed by performing the dot product of 
@@ -286,5 +288,7 @@ struct DotBasedGEMM_dd{
       });
   }
 };
+
+} // CgsolverDD namespace
 
 #endif

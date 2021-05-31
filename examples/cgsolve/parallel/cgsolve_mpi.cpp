@@ -1045,7 +1045,7 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
   tolerance *= normr;
   if (replace_residual) {
     sum_r = normr;
-    d_replace = (replace_tol/eps) * (maxNnzA * norma * sum_x + sum_r);
+    d_replace = (eps / replace_tol) * (maxNnzA * norma * sum_x + sum_r);
   }
 
   if (verbose && myRank == 0) {
@@ -1247,12 +1247,11 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
 
       d_replace_prev = d_replace;
       d_replace = (eps / replace_tol) * (maxNnzA * norma * sum_x + sum_r);
-      if (verbose) {
-        if (myRank == 0) {
-          std::cout << "  >> replace residual at Iteration = " << k << ", d = " << d_replace;
-        }
-      }
       if (replace_op == 0 || (d_replace > normr && d_replace_prev <= normr_prev) ) {
+        if (verbose && myRank == 0) {
+          std::cout << "  >> replace residual at Iteration = " << k << ", d = " << d_replace << ", normr = " << normr
+                    << ", d_prev = " << d_replace_prev << ", norm_prev = " << normr_prev << std::endl;
+        }
         // z = z + x
         axpby(z, one, z, one, x);
 
@@ -1270,7 +1269,7 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
         // update data
         sum_x = 0.0;
         sum_r = normr;
-        d_replace = (replace_tol/eps) * (maxNnzA * norma * sum_x + sum_r);
+        d_replace = (eps / replace_tol) * (maxNnzA * norma * sum_x + sum_r);
         if (verbose && myRank == 0) {
           std::cout << "  (replaced)" << std::endl;
         }
@@ -1636,6 +1635,7 @@ int main(int argc, char *argv[]) {
     int maxNnzA = 0;
     scalar_type Anorm = 0.0;
     if (replace_residual) {
+      // power iteration to approximate norm(A)
       VType p("p", b.extent(0));
       VType q_global("q",  n);
       VType q_sub = Kokkos::subview(q_global, bounds);
@@ -1651,6 +1651,7 @@ int main(int argc, char *argv[]) {
 
         // Anorm = norm(p)
         dot(p, p, Anorm);
+        MPI_Allreduce(MPI_IN_PLACE, &Anorm, 1, MPI_SCALAR, MPI_SUM, MPI_COMM_WORLD);
         Anorm = std::sqrt(Anorm);
 
         // p = p/Anorm
@@ -1659,16 +1660,12 @@ int main(int argc, char *argv[]) {
           std::cout << " norm(A) = " << Anorm << std::endl;;
         }
       }
-      if (myRank == 0) {
-        for (int i=0; i<n; i++) {
-          int nnzRowA = h_A.row_ptr(i+1) - h_A.row_ptr(i+1);
-          if (nnzRowA > maxNnzA) {
-            maxNnzA = nnzRowA;
-          }
+      for (int i=0; i<n; i++) {
+        int nnzRowA = h_A.row_ptr(i+1) - h_A.row_ptr(i+1);
+        if (nnzRowA > maxNnzA) {
+          maxNnzA = nnzRowA;
         }
       }
-      MPI_Allreduce(MPI_IN_PLACE, &maxNnzA, 1, MPI_INT, MPI_MAX,
-                    MPI_COMM_WORLD);
     }
 
     // call CG
