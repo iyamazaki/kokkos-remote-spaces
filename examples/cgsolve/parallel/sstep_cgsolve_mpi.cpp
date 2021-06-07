@@ -81,7 +81,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 using         memory_space = typename execution_space::memory_space;
 
 //#define USE_FLOAT
-//#define USE_MIXED_PRECISION
+#define USE_MIXED_PRECISION
 #if defined(USE_FLOAT)
  using      scalar_type = float;
 
@@ -89,8 +89,10 @@ using         memory_space = typename execution_space::memory_space;
  #define cusparseXcsrmv  cusparseScsrmv
  #define cusparseXcsrmm  cusparseScsrmm
  #define cublasXgemm     cublasSgemm
+ #define cublasXgemv     cublasSgemv
 
- #define cblas_xgemv_rr       cblas_sgemv
+ #define cblas_rgemv     cblas_sgemv
+ #define cblas_rdot      cblas_sdot
  #if !defined(USE_MIXED_PRECISION) // unit-precision
   using gram_scalar_type = float;
 
@@ -129,12 +131,14 @@ using         memory_space = typename execution_space::memory_space;
  #define cusparseXcsrmv      cusparseDcsrmv
  #define cusparseXcsrmm      cusparseDcsrmm
  #define cublasXgemm         cublasDgemm
+ #define cublasXgemv         cublasDgemv
 
  #define cblas_xdot          cblas_ddot
  #define cblas_xaxpy         cblas_daxpy
  #define cblas_xgemv         cblas_dgemv
 
- #define cblas_xgemv_rr      cblas_dgemv
+ #define cblas_rgemv         cblas_dgemv
+ #define cblas_rdot          cblas_ddot
  #if defined(USE_MIXED_PRECISION)
  #include "KokkosBlas3_gemm_dd.hpp"
  #include "qd/dd_real.h"
@@ -1121,7 +1125,7 @@ struct dots_stream {
 template <class XType, class YType>
 void local_copy(XType x, YType y) {
   #if 1
-  int n = x.extent(0);
+  int n = min(x.extent(0), y.extent(0));
   Kokkos::parallel_for(
       "AXPBY", n,
       KOKKOS_LAMBDA(const int &i) { x(i) = y(i); });
@@ -1279,11 +1283,6 @@ int cg_solve(VType x_out, OP op, VType b,
   auto r = getCol<VType> (1, PRX);
   auto x = getCol<VType> (2, PRX);
 
-  MType G_hat_device ("G_hat",  2*s+1, 2*s+1);
-  MType T_hat_device ("T_hat",  2*s+1, 2*s+1);
-  auto G_hat  = Kokkos::create_mirror_view(G_hat_device);
-  auto T_hat  = Kokkos::create_mirror_view(T_hat_device);
-
   // for residual replacement
   const auto eps = std::numeric_limits<scalar_type>::epsilon();
   const scalar_type replace_tol = std::sqrt(eps);
@@ -1294,8 +1293,16 @@ int cg_solve(VType x_out, OP op, VType b,
   scalar_type d_replace_check_prev = 0.0;
   Kokkos::deep_copy(x_out, zero);
 
+  MType G_hat_device ("G_hat",  2*s+1, 2*s+1);
+  MType T_hat_device ("T_hat",  2*s+1, 2*s+1);
+  MType B_hat_device ("B_hat",  2*s+1, 2*s+1);
+  auto G_hat  = Kokkos::create_mirror_view(G_hat_device);
+  auto T_hat  = Kokkos::create_mirror_view(T_hat_device);
+  auto B_hat  = Kokkos::create_mirror_view(B_hat_device);
+
   scalar_type normx = zero;
-  VType_host v_hat  ("v_hat",  2*s+1);
+  VType v_hat_device  ("v_hat",  2*s+1);
+  auto  v_hat = Kokkos::create_mirror_view(v_hat_device);
   VType_host w_hat  ("w_hat",  2*s+1);
 
   #if 1
@@ -1325,7 +1332,7 @@ int cg_solve(VType x_out, OP op, VType b,
    dd_real *B_dd = (dd_real*)malloc(ldb * (2*s+1) * sizeof(dd_real));
    dd_real *G_dd = (dd_real*)malloc(ldg * (2*s+1) * sizeof(dd_real));
 
-   using DDType = Kokkos::View<ReduceDD::dd_sum**>;
+   using DDType = Kokkos::View<CgsolverDD::ReduceDD::dd_sum**>;
    DDType DD_device("DD", 2*s+1, 2*s+1);
 
    GMType T_dd_device ("T_dd",  2*s+1, 2*(2*s+1));
@@ -1421,6 +1428,8 @@ int cg_solve(VType x_out, OP op, VType b,
   for (int i = 0;   i < s;   i++) B_dd[i+1 + i*ldb] = one_dd;
   for (int i = s+1; i < 2*s; i++) B_dd[i+1 + i*ldb] = one_dd;
   #endif
+  for (int i = 0;   i < s;   i++) B_hat(i+1, i) = one;
+  for (int i = s+1; i < 2*s; i++) B_hat(i+1, i) = one;
 
   #if defined(KOKKOS_DEBUG_CGSOLVER)
   printf("B = [\n" );
@@ -1495,7 +1504,7 @@ int cg_solve(VType x_out, OP op, VType b,
     }
     Kokkos::deep_copy(dot_host, dot_result);
     normx = std::sqrt(*(dot_host.data()));
-    d_replace = (eps / replace_tol) * (normr + maxNnzA*norma*normx);
+    d_replace = (eps / replace_tol) * (normr + scalar_type(maxNnzA)*norma*normx);
     d_replace_check = d_replace;
     d_replace_init = d_replace;
   }
@@ -1768,9 +1777,9 @@ int cg_solve(VType x_out, OP op, VType b,
     #endif
     for (int ii = 0; ii < 2*s+1; ii++) {
       #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-      yp(ii, 0) = y_dd[perm[ii]].x[0]; //+ y_dd[perm[i] + j*ldt].x[1];
-      cp(ii, 0) = c_dd[perm[ii]].x[0]; //+ c_dd[perm[i] + j*ldc].x[1];
-      tp(ii, 0) = t_dd[perm[ii]].x[0]; //+ t_dd[perm[i] + j*ldt].x[1];
+      yp(ii, 0) = y_dd[perm[ii]].x[0] + y_dd[perm[ii]].x[1];
+      cp(ii, 0) = c_dd[perm[ii]].x[0] + c_dd[perm[ii]].x[1];
+      tp(ii, 0) = t_dd[perm[ii]].x[0] + t_dd[perm[ii]].x[1];
       #else
       yp(ii, 0) = y(perm[ii], 0);
       cp(ii, 0) = c(perm[ii], 0);
@@ -1778,6 +1787,8 @@ int cg_solve(VType x_out, OP op, VType b,
       #endif
     }
 
+    scalar_type rone  (1.0);
+    scalar_type rzero (0.0);
     #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
     dd_real alpha  = zero_dd;
     dd_real beta   = zero_dd;
@@ -1937,9 +1948,9 @@ int cg_solve(VType x_out, OP op, VType b,
       #endif
       for (int ii = 0; ii < 2*s+1; ii++) {
         #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-        yp(ii, i+1) = y_dd[perm[ii] + (i+1)*ldt].x[0]; //+ y_dd[perm[i] + j*ldt].x[1];
-        cp(ii, i+1) = c_dd[perm[ii] + (i+1)*ldc].x[0]; //+ c_dd[perm[i] + j*ldc].x[1];
-        tp(ii, i+1) = t_dd[perm[ii] + (i+1)*ldt].x[0]; //+ t_dd[perm[i] + j*ldt].x[1];
+        yp(ii, i+1) = y_dd[perm[ii] + (i+1)*ldt].x[0] + y_dd[perm[ii] + (i+1)*ldt].x[1];
+        cp(ii, i+1) = c_dd[perm[ii] + (i+1)*ldc].x[0] + c_dd[perm[ii] + (i+1)*ldc].x[1];
+        tp(ii, i+1) = t_dd[perm[ii] + (i+1)*ldt].x[0] + t_dd[perm[ii] + (i+1)*ldt].x[1];
         #else
         yp(ii, i+1) = y(perm[ii], i+1);
         cp(ii, i+1) = c(perm[ii], i+1);
@@ -1947,43 +1958,53 @@ int cg_solve(VType x_out, OP op, VType b,
         #endif
       }
       if (replace_residual) {
-        // || y ||
-        beta0_hat = std::sqrt( cblas_xdot(2*s+1, yi1.data(), 1, yi1.data(), 1) );
-
+        // NOTE: these are done in working precision
         // || |V_k| |y| || ~ sqrt(|y|^T * G_hat * |y|)
+        #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+        for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(yi1_dd[ii].x[0] + yi1_dd[ii].x[1]);
+        #else
         for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(yi1(ii));
-        cblas_xgemv (CblasColMajor, CblasNoTrans,
+        #endif
+        cblas_rgemv (CblasColMajor, CblasNoTrans,
               2*s+1, 2*s+1,
-              cone,  G_hat.data(), 2*s+1,
+              rone,  G_hat.data(), 2*s+1,
                      v_hat.data(), 1,
-              czero, w_hat.data(),   1);
-        beta1_hat = std::sqrt( cblas_xdot(2*s+1, w_hat.data(), 1, v_hat.data(), 1) );
+              rzero, w_hat.data(),   1);
+        beta1_hat = std::sqrt( cblas_rdot(2*s+1, w_hat.data(), 1, v_hat.data(), 1) );
 
         // || |V_k| |r| || ~ sqrt(|t|^T * G_hat * |t|)
+        #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+        for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(ti1_dd[ii].x[0] + ti1_dd[ii].x[1]);
+        #else
         for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(ti1(ii));
-        cblas_xgemv (CblasColMajor, CblasNoTrans,
+        #endif
+        cblas_rgemv (CblasColMajor, CblasNoTrans,
               2*s+1, 2*s+1,
-              cone,  G_hat.data(), 2*s+1,
+              rone,  G_hat.data(), 2*s+1,
                      v_hat.data(), 1,
-              czero, w_hat.data(),   1);
-        beta2_hat = std::sqrt( cblas_xdot(2*s+1, w_hat.data(), 1, v_hat.data(), 1) );
+              rzero, w_hat.data(),   1);
+        beta2_hat = std::sqrt( cblas_rdot(2*s+1, w_hat.data(), 1, v_hat.data(), 1) );
 
         // || |V_k| |B| |y| || ~ sqrt(|y|^T * B_hat^T * G_hat * B_hat * |y|)
+        #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+        for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(yi1_dd[ii].x[0] + yi1_dd[ii].x[1]);
+        #else
         for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(yi1(ii));
-        cblas_xgemv (CblasColMajor, CblasNoTrans,
+        #endif
+        cblas_rgemv (CblasColMajor, CblasNoTrans,
               2*s+1, 2*s+1,
-              cone,  B.data(), 2*s+1,
+              rone,  B_hat.data(), 2*s+1,
                      v_hat.data(), 1,
-              czero, w_hat.data(),   1);
-        cblas_xgemv (CblasColMajor, CblasNoTrans,
+              rzero, w_hat.data(),   1);
+        cblas_rgemv (CblasColMajor, CblasNoTrans,
               2*s+1, 2*s+1,
-              cone,  G_hat.data(), 2*s+1,
+              rone,  G_hat.data(), 2*s+1,
                      w_hat.data(), 1,
-              czero, v_hat.data(),   1);
-        beta3_hat = std::sqrt( cblas_xdot(2*s+1, w_hat.data(), 1, v_hat.data(), 1) );
+              rzero, v_hat.data(),   1);
+        beta3_hat = std::sqrt( cblas_rdot(2*s+1, w_hat.data(), 1, v_hat.data(), 1) );
 
         d_replace_prev = d_replace;
-        d_replace += (eps / replace_tol) * ((4 + maxNnzA) * (norma * beta1_hat + beta3_hat) + beta2_hat);
+        d_replace += (eps / replace_tol) * (scalar_type(4 + maxNnzA) * (norma * beta1_hat + beta3_hat) + beta2_hat);
         //std::cout << " > beta_hat = " << beta0_hat << ", " << beta1_hat << ", " << beta2_hat << ", " << beta3_hat << std::endl;
         //printf( " ++ %e / %e * (%d * (%e * %e + %e) + %e = %e\n",eps,replace_tol, 4+maxNnzA,norma,beta1_hat,beta3_hat,beta2_hat,d_replace );
 
@@ -1991,17 +2012,25 @@ int cg_solve(VType x_out, OP op, VType b,
         // replace residual vector, check
         d_replace_check_prev = d_replace_check;
         d_replace_check = beta2_hat;
-        std::cout << " > d_replace " << d_replace_prev << " -> " << d_replace << " rnorm*|V| " << d_replace_check_prev << " -> " << d_replace_check << std::endl;
-        if (replace_op == 0 || (d_replace > d_replace_check && d_replace_prev <= d_replace_check_prev && d_replace > replace_check_tol * d_replace_init) ) {
+        //std::cout << " > d_replace " << d_replace_prev << " -> " << d_replace << " rnorm*|V| " << d_replace_check_prev << " -> " << d_replace_check << std::endl;
+        if (replace_op == 0 || (d_replace > d_replace_check &&
+                                d_replace_prev <= d_replace_check_prev &&
+                                d_replace > replace_check_tol * d_replace_init) ) {
+          if (verbose && myRank == 0) {
+            std::cout << "  (replaced with step = " << step << " at iter = " << k
+                      << " with d_replace = " << d_replace_prev << " -> " << d_replace
+                      << " and d_replace_check = " << d_replace_check_prev << " -> " << d_replace_check;
+          }
           // group update
           // update x
           auto yp_i = getCol<GVType> (i+1, yp_device); // device
           auto yp_i_host = getCol<GVType_host> (i+1, yp); // host
-          Kokkos::deep_copy(yp_i, yp_i_host); // cast
-          cublasDgemv(cublasHandle, CUBLAS_OP_N,
-                      nloc, 2*s+1, &(one),    V.data(), nloc,
-                                           yp_i.data(), 1,
-                                   &(one),    x.data(), 1);
+          Kokkos::deep_copy(yp_i, yp_i_host); // to device
+          local_copy(v_hat_device, yp_i);     // cast
+          cublasXgemv(cublasHandle, CUBLAS_OP_N,
+                      nloc, 2*s+1, &(one),  V.data(), nloc,
+                                            v_hat_device.data(), 1,
+                                   &(one),  x.data(), 1);
           //for (int ii = 0; ii < 2*s+1; ii++) printf( " + ypi(%d) = %.2e\n",ii,yp_i_host(ii));
           // z = z + x
           axpby(x_out, one, x_out, one, x);
@@ -2019,8 +2048,12 @@ int cg_solve(VType x_out, OP op, VType b,
           replaced = true;
 
           // update 
+          #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+          for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(ti1_dd[ii].x[0] + ti1_dd[ii].x[1]);
+          #else
           for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(ti1(ii));
-          beta2_hat = std::sqrt( cblas_xdot(2*s+1, v_hat.data(), 1, v_hat.data(), 1) );
+          #endif
+          beta2_hat = std::sqrt( cblas_rdot(2*s+1, v_hat.data(), 1, v_hat.data(), 1) );
 
           dot(x_out, x_out, dot_result);
           if (numRanks > 1) {
@@ -2031,8 +2064,8 @@ int cg_solve(VType x_out, OP op, VType b,
           normx = std::sqrt(*(dot_host.data()));
 
           d_replace = (eps / replace_tol) * (beta2_hat + (1+2*maxNnzA)*norma*normx);
-          d_replace_check = d_replace;
           d_replace_init = d_replace;
+          //d_replace_check = d_replace;
           step = i+1;
 
           if (verbose) {
@@ -2044,16 +2077,13 @@ int cg_solve(VType x_out, OP op, VType b,
             Kokkos::deep_copy(dot_host, dot_result);
             normr = std::sqrt(*(dot_host.data()));
             if (myRank == 0) {
-              std::cout << "  (replaced with step = " << step << ") at iter = " << k << " with resnorm = " << normr << std::endl;
+              std::cout << "  and with resnorm = " << normr << ") with d_replace = " << eps / replace_tol
+                        << " * (" << beta2_hat << " + " << (1+2*maxNnzA) << " * " << norma << " * " << normx
+                        << " -> " << d_replace
+                        << std::endl;
             }
           }
           break;
-        } else {
-          if (verbose && myRank == 0) {
-            std::cout << "  (not replaced)" << std::endl;
-          }
-          d_replace += (eps / replace_tol) * (norma * (beta0_hat + (2 + 2*maxNnzA) * beta1_hat) + maxNnzA * beta2_hat);
-          //printf( " >> %e / %e * (%e*%e + %d * %e + %d * %e = %e\n",eps,replace_tol, norma,beta0_hat, 2+2*maxNnzA, beta1_hat, maxNnzA,beta2_hat,d_replace );
         }
       }
     }
@@ -2155,12 +2185,13 @@ int cg_solve(VType x_out, OP op, VType b,
     if (replaced) {
       auto cp_i = getCol<GVType> (step, cp_device); // device
       auto cp_i_host = getCol<GVType_host> (step, cp); // host
-      Kokkos::deep_copy(cp_i, cp_i_host); // cast
+      Kokkos::deep_copy(cp_i, cp_i_host); // to device
+      local_copy(v_hat_device, cp_i);     // cast
       //for (int ii = 0; ii < 2*s+1; ii++) printf( " + cpi(%d) = %.2e\n",ii,cp_i_host(ii));
-      cublasDgemv(cublasHandle, CUBLAS_OP_N,
-                  nloc, 2*s+1, &(one),     V.data(), nloc,
-                                        cp_i.data(), 1,
-                               &(zero),    p.data(), 1);
+      cublasXgemv(cublasHandle, CUBLAS_OP_N,
+                  nloc, 2*s+1, &(one),  V.data(), nloc,
+                                        v_hat_device.data(), 1,
+                               &(zero), p.data(), 1);
     } else {
       #if defined(CGSOLVE_ENABLE_CUBLAS)
       #if 0
@@ -2194,9 +2225,24 @@ int cg_solve(VType x_out, OP op, VType b,
                   nloc, 3, 2*s+1, &(one),  V.data(), n, // V is subview of V_global
                                            CTY.data(), 2*s+1,
                                   &(one),  PRX.data(), nloc);
+      #endif
+      #endif
+      if (replace_residual) {
+        dot(x, x, dot_result);
+        if (numRanks > 1) {
+          MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
+                        MPI_COMM_WORLD);
+        }
+        Kokkos::deep_copy(dot_host, dot_result);
+        beta0_hat = std::sqrt(*(dot_host.data()));
+        //if (verbose && myRank == 0) {
+        //  std::cout << "  (not replaced)" << std::endl;
+        //}
+        d_replace += (eps / replace_tol) * (norma * (beta0_hat + scalar_type(2 + 2*maxNnzA) * beta1_hat) + scalar_type(maxNnzA) * beta2_hat);
+        //printf( " >> %e / %e * (%e*%e + %d * %e + %d * %e = %e\n",eps,replace_tol, norma,beta0_hat, 2+2*maxNnzA, beta1_hat, maxNnzA,beta2_hat,d_replace );
+      }
     }
     local_mv_copy(V01, PR);
-    #endif
     if (time_axpy_on) {
       Kokkos::fence();
       time_axpy += timer_axpy.seconds();
@@ -2224,11 +2270,10 @@ int cg_solve(VType x_out, OP op, VType b,
       for (int i = 0; i < nloc; i++) printf( " + r(%d) = %.2e,\t p(%d) = %.2e,\t x(%d) = %.2e\n",i,r_host(i),i,p0_host(i),i,x_host(i) );*/
     }
     #endif
-    #endif
 
     if (verbose) {
       // r = b - A*x
-      #if 1
+      #if 1 // compute explicit residual norm
       Kokkos::deep_copy(x_sub, x);
       if (replace_residual) {
         axpby(x_sub, one, x_sub, one, x_out);
@@ -2275,6 +2320,11 @@ int cg_solve(VType x_out, OP op, VType b,
   time_cg = timer_cg.seconds();
   if (myRank == 0) {
     std::cout << " > s-step CG Main loop : iter = " << num_iters << " time = " << time_cg << std::endl;
+    if (normr > tolerance) {
+      std::cout << " >  failed to converge with normr = " << normr << " and tol = " << tolerance << std::endl;
+    } else {
+      std::cout << " >  converged with normr = " << normr << " and tol = " << tolerance << std::endl;
+    }
   }
 
   if (time_spmv_on || time_dot_on || time_axpy_on) {
@@ -2409,7 +2459,7 @@ int main(int argc, char *argv[]) {
     scalar_type tolerance = 1e-8;
     std::string matrixFilename {""};
 
-    int replace_op = 0; // 0: replace at every step
+    int replace_op = 1; // 0: replace at every step
     double replace_check_tol = 0.0;
     bool replace_residual = false;
 

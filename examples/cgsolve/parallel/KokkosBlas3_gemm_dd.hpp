@@ -122,14 +122,6 @@ namespace ReduceDD {
    };
 }
 
-namespace Kokkos { //reduction identity must be defined in Kokkos namespace
-   template<>
-   struct reduction_identity< ReduceDD::dd_sum > {
-      KOKKOS_FORCEINLINE_FUNCTION static ReduceDD::dd_sum sum() {
-         return ReduceDD::dd_sum();
-      }
-   };
-}
 /* ------------------------------------------------------------------------------------ */
 
 
@@ -290,5 +282,14 @@ struct DotBasedGEMM_dd{
 };
 
 } // CgsolverDD namespace
+
+namespace Kokkos { //reduction identity must be defined in Kokkos namespace
+   template<>
+   struct reduction_identity< CgsolverDD::ReduceDD::dd_sum > {
+      KOKKOS_FORCEINLINE_FUNCTION static CgsolverDD::ReduceDD::dd_sum sum() {
+         return CgsolverDD::ReduceDD::dd_sum();
+      }
+   };
+}
 
 #endif

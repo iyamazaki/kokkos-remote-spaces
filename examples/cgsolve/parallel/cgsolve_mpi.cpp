@@ -73,7 +73,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using memory_space = typename execution_space::memory_space;
 
-//#define USE_FLOAT
+#define USE_FLOAT
 #if defined(USE_FLOAT)
  using scalar_type = float;
 
@@ -1249,8 +1249,9 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
       d_replace = (eps / replace_tol) * (maxNnzA * norma * sum_x + sum_r);
       if (replace_op == 0 || (d_replace > normr && d_replace_prev <= normr_prev) ) {
         if (verbose && myRank == 0) {
-          std::cout << "  >> replace residual at Iteration = " << k << ", d = " << d_replace << ", normr = " << normr
-                    << ", d_prev = " << d_replace_prev << ", norm_prev = " << normr_prev << std::endl;
+          std::cout << "  >> replace residual at Iter = " << k << ", d = " << d_replace << ", normr = " << normr
+                    << ", d_prev = " << d_replace_prev << ", norm_prev = " << normr_prev << ", replace_op = " << replace_op
+                    << std::endl;
         }
         // z = z + x
         axpby(z, one, z, one, x);
@@ -1270,13 +1271,10 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
         sum_x = 0.0;
         sum_r = normr;
         d_replace = (eps / replace_tol) * (maxNnzA * norma * sum_x + sum_r);
-        if (verbose && myRank == 0) {
-          std::cout << "  (replaced)" << std::endl;
-        }
       } else {
-        if (verbose && myRank == 0) {
-          std::cout << "  (not replaced)" << std::endl;
-        }
+        //if (verbose && myRank == 0) {
+        //  std::cout << "  (not replaced)" << std::endl;
+        //}
       }
     }
 
@@ -1449,7 +1447,7 @@ int main(int argc, char *argv[]) {
     scalar_type tolerance = 1e-8;
     std::string matrixFilename {""};
 
-    int replace_op = 0; // 0: replace at every step
+    int replace_op = 1; // 0: replace at every step
     bool replace_residual = false;
 
     bool metis       = false;
