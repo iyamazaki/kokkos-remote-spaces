@@ -73,7 +73,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using memory_space = typename execution_space::memory_space;
 
-#define USE_FLOAT
+//#define USE_FLOAT
 #if defined(USE_FLOAT)
  using scalar_type = float;
 
@@ -1233,13 +1233,25 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
     // replace residual vector, check
     if (replace_residual) {
       // compute norm(x) for now
+      if (time_dot_on) {
+        Kokkos::fence();
+        timer_dot.reset();
+      }
       dot(x, x, dot_result);
+      if (time_dot_on) {
+        time_dot += timer_dot.seconds();
+        flop_dot += 2*nloc-1;
+        timer_dot.reset();
+      }
       if (numRanks > 1) {
         MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                       MPI_COMM_WORLD);
       }
       Kokkos::deep_copy(dot_host, dot_result);
       normx = std::sqrt(*(dot_host.data()));
+      if (time_dot_on) {
+        time_dot_comm += timer_dot.seconds();
+      }
 
       // accumulate
       sum_x += normx;
@@ -1254,16 +1266,49 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
                     << std::endl;
         }
         // z = z + x
+        if (time_axpy_on) {
+          timer_axpy.reset();
+        }
         axpby(z, one, z, one, x);
+        if (time_axpy_on) {
+          Kokkos::fence();
+          time_axpby += timer_axpy.seconds();
+          flop_axpby += 2*nloc;
+        }
 
-        // r = b - A*z
+        // Ax = A*z
+        if (time_spmv_on) {
+          timer_spmv.reset();
+        }
         Kokkos::deep_copy(x_sub, z);
         op1.apply(Ax, x_global);          // Ax = A*x
+        if (time_spmv_on) {
+          Kokkos::fence();
+          time_spmv += timer_spmv.seconds();
+          time_spmv_comm   += op2.time_comm;
+          time_spmv_spmv   += op2.time_spmv;
+          #if defined(CGSOLVE_SPMV_TIMER)
+          time_spmv_copy   += op2.time_comm_copy;
+          time_spmv_pack   += op2.time_comm_pack;
+          time_spmv_unpack += op2.time_comm_unpack;
+          time_spmv_mpi    += op2.time_comm_mpi;
+          time_spmv_wait_send += op2.time_comm_wait_send;
+          time_spmv_wait_recv += op2.time_comm_wait_recv;
+          #endif
+        }
+        // r = b - A*z
+        if (time_axpy_on) {
+          timer_axpy.reset();
+        }
         axpby(r_true, one, b, -one, Ax);  // r = b-Ax
+        if (time_axpy_on) {
+          Kokkos::fence();
+          time_axpby += timer_axpy.seconds();
+          flop_axpby += 2*nloc;
+        }
 
         // cast-copy to inner r
         axpby(r, one, r_true, zero, r_true); //
-
         // x = zero
         Kokkos::deep_copy(x, zero);
 
