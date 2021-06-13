@@ -1172,6 +1172,13 @@ void local_mv_init(XType x, scalar_type val) {
   #endif
 }
 
+template <class VType_device, class VType_host>
+void copy_to_device(VType_device dst, VType_host src) {
+  using copy_scalar_type = typename VType_host::value_type;
+  size_t count = min(dst.extent(0), src.extent(0)) * sizeof(copy_scalar_type);
+  cudaMemcpyAsync(dst.data(), src.data(), count, cudaMemcpyHostToDevice); 
+}
+
 // -------------------------------------------------------------
 // axpby
 template <class ZType, class YType, class XType>
@@ -1293,51 +1300,49 @@ int cg_solve(VType x_out, OP op, VType b,
   scalar_type d_replace_check_prev = 0.0;
   Kokkos::deep_copy(x_out, zero);
 
-  MType G_hat_device ("G_hat",  2*s+1, 2*s+1);
-  MType T_hat_device ("T_hat",  2*s+1, 2*s+1);
-  MType B_hat_device ("B_hat",  2*s+1, 2*s+1);
+  int s2p1 = 2*s+1;
+  MType G_hat_device ("G_hat",  s2p1, s2p1);
+  MType T_hat_device ("T_hat",  s2p1, s2p1);
+  MType B_hat_device ("B_hat",  s2p1, s2p1);
   auto G_hat  = Kokkos::create_mirror_view(G_hat_device);
   auto T_hat  = Kokkos::create_mirror_view(T_hat_device);
   auto B_hat  = Kokkos::create_mirror_view(B_hat_device);
 
   scalar_type normx = zero;
-  VType v_hat_device  ("v_hat",  2*s+1);
+  VType v_hat_device ("v_hat",  s2p1);
   auto  v_hat = Kokkos::create_mirror_view(v_hat_device);
-  VType_host w_hat  ("w_hat",  2*s+1);
+  VType_host w_hat   ("w_hat",  s2p1);
 
-  #if 1
+  // basis vectors
   int         n = op.getGlobalDim();
   int start_row = op.getStartRow();
   int   end_row = op.getEndRow();
   Kokkos::pair<int, int> local_rows(start_row, end_row);
-  MType  V_global("V_global",  n, 2*s+1);
+  MType  V_global("V_global",  n, s2p1);
   auto V = Kokkos::subview(V_global, local_rows, Kokkos::ALL ());
   auto V01 = Kokkos::subview(V, Kokkos::ALL (), pr_cols);
 
   // option to explicitly cast
-  GMType V2("V2",  nloc, 2*s+1);
-  #else
-  MType  V("V_global",  nloc, 2*s+1);
-  #endif
+  GMType V2("V2",  nloc, s2p1);
   auto p0 = getCol<VType> (0, V);
   auto p1 = getCol<VType> (1, V);
 
   // change-of-basis
-  GMType B_device ("B",  2*s+1, 2*s+1);
+  GMType B_device ("B",  s2p1, s2p1);
   auto B  = Kokkos::create_mirror_view(B_device);
   // Gram
   #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-   int ldg = 2*s+1;
-   int ldb = 2*s+1;
-   dd_real *B_dd = (dd_real*)malloc(ldb * (2*s+1) * sizeof(dd_real));
-   dd_real *G_dd = (dd_real*)malloc(ldg * (2*s+1) * sizeof(dd_real));
+   int ldg = s2p1;
+   int ldb = s2p1;
+   dd_real *B_dd = (dd_real*)malloc(ldb * s2p1 * sizeof(dd_real));
+   dd_real *G_dd = (dd_real*)malloc(ldg * s2p1 * sizeof(dd_real));
 
    using DDType = Kokkos::View<CgsolverDD::ReduceDD::dd_sum**>;
-   DDType DD_device("DD", 2*s+1, 2*s+1);
+   DDType DD_device("DD", s2p1, s2p1);
 
-   GMType T_dd_device ("T_dd",  2*s+1, 2*(2*s+1));
-   Kokkos::pair<int, int> dd_hi_cols(0,     1*(2*s+1));
-   Kokkos::pair<int, int> dd_lo_cols(2*s+1, 2*(2*s+1));
+   GMType T_dd_device ("T_dd",  s2p1, 2*s2p1);
+   Kokkos::pair<int, int> dd_hi_cols(0,    1*s2p1);
+   Kokkos::pair<int, int> dd_lo_cols(s2p1, 2*s2p1);
    auto T_device    = Kokkos::subview(T_dd_device, Kokkos::ALL (), dd_hi_cols);
    auto T_lo_device = Kokkos::subview(T_dd_device, Kokkos::ALL (), dd_lo_cols);
 
@@ -1347,14 +1352,14 @@ int cg_solve(VType x_out, OP op, VType b,
    auto T    = Kokkos::subview(T_dd, Kokkos::ALL (), dd_hi_cols);
    auto T_lo = Kokkos::subview(T_dd, Kokkos::ALL (), dd_lo_cols);
   #else // not with DD
-   GMType T_device ("T",  2*s+1, 2*s+1);
+   GMType T_device ("T",  s2p1, s2p1);
    auto T  = Kokkos::create_mirror_view(T_device);
   #endif
-  GMType G_device ("G",  2*s+1, 2*s+1);
+  GMType G_device ("G",  s2p1, s2p1);
   auto G  = Kokkos::create_mirror_view(G_device);
   // alpha & beta
-  int ldc = 2*s+1;
-  int ldt = 2*s+1;
+  int ldc = s2p1;
+  int ldt = s2p1;
   GMType c_device ("c",  ldc, s+1);
   GMType t_device ("t",  ldt, s+1);
   GMType y_device ("y",  ldt, s+1);
@@ -1398,7 +1403,7 @@ int cg_solve(VType x_out, OP op, VType b,
   #endif
   //#define KOKKOS_DEBUG_CGSOLVER
   #if 1//defined(KOKKOS_DEBUG_CGSOLVER)
-  MType V_local ("V_local", nloc, 2*s+1);
+  MType V_local ("V_local", nloc, s2p1);
   auto  V_global_host = Kokkos::create_mirror_view(V_global);
   auto  r_host   = Kokkos::create_mirror_view(r);
   auto  x_host   = Kokkos::create_mirror_view(x);
@@ -1410,8 +1415,8 @@ int cg_solve(VType x_out, OP op, VType b,
   auto  x_out_host  = Kokkos::create_mirror_view(x);
   #endif
   // perm to go from V = [p,r,A*p,A*r, ..] to V = [p,A*p, .., r, A*r]
-  int *perm = (int*)malloc((2*s+1)*sizeof(int));
-  int *iperm = (int*)malloc((2*s+1)*sizeof(int));
+  int * perm = (int*)malloc(s2p1*sizeof(int));
+  int *iperm = (int*)malloc(s2p1*sizeof(int));
   for (int i = 0; i < s; i++) {
     perm[2*i + 0] = i;
     perm[2*i + 1] = 1+i + s;
@@ -1497,7 +1502,16 @@ int cg_solve(VType x_out, OP op, VType b,
     //printf( " %e / %e * (%d * %e * %e + %e) = %e\n",replace_tol,eps, maxNnzA,norma, sum_x, sum_r, d_replace );
 
     // compute norm(x)
+    if (time_dot_on) {
+      timer_dot.reset();
+    }
     dot(x, x, dot_result);
+    if (time_dot_on) {
+      Kokkos::fence();
+      time_dot += timer_dot.seconds();
+      flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+      timer_dot.reset();
+    }
     if (numRanks > 1) {
       MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                     MPI_COMM_WORLD);
@@ -1641,16 +1655,16 @@ int cg_solve(VType x_out, OP op, VType b,
     if (time_dot_on) {
       Kokkos::fence();
       time_dot += timer_dot.seconds();
-      flop_dot += (2*s+1)*(2*s+1)*(2*nloc-1);
+      flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
       timer_dot.reset();
     }
 
     if (numRanks > 1) {
       Kokkos::fence();
       #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-      MPI_Allreduce(MPI_IN_PLACE, T_dd_device.data(), 2*(2*s+1)*(2*s+1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE, T_dd_device.data(), 2*(s2p1*s2p1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
       #else
-      MPI_Allreduce(MPI_IN_PLACE, T_device.data(), (2*s+1)*(2*s+1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE, T_device.data(), s2p1*s2p1, MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
       #endif
     }
     #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
@@ -1660,17 +1674,32 @@ int cg_solve(VType x_out, OP op, VType b,
     #else
     Kokkos::deep_copy(T, T_device);
     #endif
+    if (time_dot_on) {
+      time_dot_comm += timer_dot.seconds();
+    }
 
     // another dot for residual replacement
     if (replace_residual) {
+      if (time_dot_on) {
+        timer_dot.reset();
+      }
       CgsolverRR::
       DotBasedGEMM_rr<execution_space, MType, MType, MType> gemm(one,  V, V, zero, T_hat_device, true);
       gemm.run(false);
+      if (time_dot_on) {
+        Kokkos::fence();
+        time_dot += timer_dot.seconds();
+        flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+        timer_dot.reset();
+      }
       if (numRanks > 1) {
         Kokkos::fence();
-        MPI_Allreduce(MPI_IN_PLACE, T_hat_device.data(), (2*s+1)*(2*s+1), MPI_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, T_hat_device.data(), s2p1*s2p1, MPI_SCALAR, MPI_SUM, MPI_COMM_WORLD);
       }
       Kokkos::deep_copy(T_hat, T_hat_device);
+      if (time_dot_on) {
+        time_dot_comm += timer_dot.seconds();
+      }
     }
 
     for (int i = 0; i < 2*s+1; i++) {
@@ -1690,9 +1719,6 @@ int cg_solve(VType x_out, OP op, VType b,
           G_hat(perm[j], perm[i]) = T_hat(i, j);
         }
       }
-    }
-    if (time_dot_on) {
-      time_dot_comm += timer_dot.seconds();
     }
     #if defined(KOKKOS_DEBUG_CGSOLVER)
     if (myRank == printRank) {
@@ -1766,9 +1792,6 @@ int cg_solve(VType x_out, OP op, VType b,
     auto t0 = getCol<GVType_host> (0, t);
     auto c0 = getCol<GVType_host> (0, c);
     auto y0 = getCol<GVType_host> (0, y);
-    //Kokkos::deep_copy(t0, zero);
-    //Kokkos::deep_copy(c0, zero);
-    //Kokkos::deep_copy(y0, zero);
     memset(t0.data(), 0, ldc*sizeof(gram_scalar_type));
     memset(c0.data(), 0, ldc*sizeof(gram_scalar_type));
     memset(y0.data(), 0, ldc*sizeof(gram_scalar_type));
@@ -1917,14 +1940,12 @@ int cg_solve(VType x_out, OP op, VType b,
                    ci1_dd, 1);
       #else
       // update y = y + alpha*c
-      //Kokkos::deep_copy(yi1, yi0);
       memcpy(yi1.data(), yi0.data(), ldt*sizeof(gram_scalar_type));
       cblas_xaxpy (
             2*s+1, 
             alpha, ci0.data(), 1,
                    yi1.data(), 1);
       // update t = t - alpha*c2
-      //Kokkos::deep_copy(ti1, ti0);
       memcpy(ti1.data(), ti0.data(), ldt*sizeof(gram_scalar_type));
       cblas_xaxpy (
             2*s+1, 
@@ -1939,7 +1960,6 @@ int cg_solve(VType x_out, OP op, VType b,
       beta1 = cblas_xdot(2*s+1, w.data(), 1, ti1.data(), 1);
       beta = beta1 / alpha1;
       // update c = t + beta*c
-      //Kokkos::deep_copy(ci1, ti1);
       memcpy(ci1.data(), ti1.data(), ldt*sizeof(gram_scalar_type));
       cblas_xaxpy (
             2*s+1, 
@@ -2012,7 +2032,6 @@ int cg_solve(VType x_out, OP op, VType b,
         // replace residual vector, check
         d_replace_check_prev = d_replace_check;
         d_replace_check = beta2_hat;
-        //std::cout << " > d_replace " << d_replace_prev << " -> " << d_replace << " rnorm*|V| " << d_replace_check_prev << " -> " << d_replace_check << std::endl;
         if (replace_op == 0 || (d_replace > d_replace_check &&
                                 d_replace_prev <= d_replace_check_prev &&
                                 d_replace > replace_check_tol * d_replace_init) ) {
@@ -2021,51 +2040,91 @@ int cg_solve(VType x_out, OP op, VType b,
                       << " with d_replace = " << d_replace_prev << " -> " << d_replace
                       << " and d_replace_check = " << d_replace_check_prev << " -> " << d_replace_check;
           }
+          // --------------------------------------
           // group update
-          // update x
+          if (time_axpy_on) {
+            timer_axpy.reset();
+          }
+          // > update x
           auto yp_i = getCol<GVType> (i+1, yp_device); // device
           auto yp_i_host = getCol<GVType_host> (i+1, yp); // host
-          Kokkos::deep_copy(yp_i, yp_i_host); // to device
+          //Kokkos::deep_copy(yp_i, yp_i_host); // to device
+          copy_to_device (yp_i, yp_i_host); // to device
           local_copy(v_hat_device, yp_i);     // cast
           cublasXgemv(cublasHandle, CUBLAS_OP_N,
                       nloc, 2*s+1, &(one),  V.data(), nloc,
                                             v_hat_device.data(), 1,
                                    &(one),  x.data(), 1);
-          //for (int ii = 0; ii < 2*s+1; ii++) printf( " + ypi(%d) = %.2e\n",ii,yp_i_host(ii));
-          // z = z + x
+          // > z = z + x
           axpby(x_out, one, x_out, one, x);
-          //Kokkos::deep_copy(x_host, x);
-          //Kokkos::deep_copy(x_out_host, x_out);
-          //for (int ii = 0; ii < nloc; ii++) printf( " + x(%d) = %.2e -> %.2e\n",ii,x_host(ii),x_out_host(ii));
-          // x = zero
-          Kokkos::deep_copy(x, zero);
-          // explicit residual vector
-          Kokkos::deep_copy(x_sub, x_out);
+          // > x = zero
+          //Kokkos::deep_copy(x, zero);
+          local_init(x, zero);
+          if (time_axpy_on) {
+            Kokkos::fence();
+            time_axpy += timer_axpy.seconds();
+            flop_axpy += 1*(4*s)*nloc;
+          }
+
+          // --------------------------------------
+          // compute explicit residual vector
+          if (time_spmv_on) {
+            Kokkos::fence();
+            timer_spmv.reset();
+          }
+          //Kokkos::deep_copy(x_sub, x_out);
+          local_copy(x_sub, x_out);
           op.apply(Ax, x_global);      // Ax = A*x
           axpby(r, one, b, -one, Ax);  // r = b-Ax
-          //Kokkos::deep_copy(r_host, r);
-          //for (int ii = 0; ii < nloc; ii++) printf( " + r(%d) = %.2e\n",ii,r_host(ii));
+          if (time_spmv_on) {
+            Kokkos::fence();
+            time_spmv_comm   += op.time_comm;
+            time_spmv_spmv   += op.time_spmv;
+            #if defined(CGSOLVE_SPMV_TIMER)
+            time_spmv_copy   += op.time_comm_copy;
+            time_spmv_pack   += op.time_comm_pack;
+            time_spmv_unpack += op.time_comm_unpack;
+            time_spmv_mpi    += op.time_comm_mpi;
+            time_spmv_wait_send += op.time_comm_wait_send;
+            time_spmv_wait_recv += op.time_comm_wait_recv;
+            #endif
+          }
           replaced = true;
 
-          // update 
+          // --------------------------------------
+          // compute norm(x)
           #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
           for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(ti1_dd[ii].x[0] + ti1_dd[ii].x[1]);
           #else
           for (int ii=0; ii<2*s+1; ii++) v_hat(ii) = abs(ti1(ii));
           #endif
           beta2_hat = std::sqrt( cblas_rdot(2*s+1, v_hat.data(), 1, v_hat.data(), 1) );
-
+          if (time_dot_on) {
+            timer_dot.reset();
+          }
           dot(x_out, x_out, dot_result);
+          if (time_dot_on) {
+            Kokkos::fence();
+            time_dot += timer_dot.seconds();
+            flop_dot += (2*nloc-1);
+          }
           if (numRanks > 1) {
+            if (time_dot_on) {
+              timer_dot.reset();
+            }
             MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                           MPI_COMM_WORLD);
+            if (time_dot_on) {
+              time_dot_comm += timer_dot.seconds();
+            }
           }
           Kokkos::deep_copy(dot_host, dot_result);
           normx = std::sqrt(*(dot_host.data()));
 
+          // --------------------------------------
+          // reinitialize
           d_replace = (eps / replace_tol) * (beta2_hat + (1+2*maxNnzA)*norma*normx);
           d_replace_init = d_replace;
-          //d_replace_check = d_replace;
           step = i+1;
 
           if (verbose) {
@@ -2155,9 +2214,6 @@ int cg_solve(VType x_out, OP op, VType b,
 
     // ==============================================================================
     // update local vectors
-    if (time_axpy_on) {
-      timer_axpy.reset();
-    }
     #if defined(KOKKOS_DEBUG_CGSOLVER)
     if (myRank == printRank) {
       for (int i = 0; i < 2*s+1; i++) printf( " y1(%d) = %.2e\n",i,yp_s_host(i) );
@@ -2182,16 +2238,24 @@ int cg_solve(VType x_out, OP op, VType b,
       printf("];\n");
     }
     #endif
+    if (time_axpy_on) {
+      timer_axpy.reset();
+    }
     if (replaced) {
       auto cp_i = getCol<GVType> (step, cp_device); // device
       auto cp_i_host = getCol<GVType_host> (step, cp); // host
-      Kokkos::deep_copy(cp_i, cp_i_host); // to device
+      //Kokkos::deep_copy(cp_i, cp_i_host); // to device
+      copy_to_device (cp_i, cp_i_host); // to device
       local_copy(v_hat_device, cp_i);     // cast
-      //for (int ii = 0; ii < 2*s+1; ii++) printf( " + cpi(%d) = %.2e\n",ii,cp_i_host(ii));
       cublasXgemv(cublasHandle, CUBLAS_OP_N,
                   nloc, 2*s+1, &(one),  V.data(), nloc,
                                         v_hat_device.data(), 1,
                                &(zero), p.data(), 1);
+      if (time_axpy_on) {
+        Kokkos::fence();
+        time_axpy += timer_axpy.seconds();
+        flop_axpy += (4*s)*nloc;
+      }
     } else {
       #if defined(CGSOLVE_ENABLE_CUBLAS)
       #if 0
@@ -2214,9 +2278,12 @@ int cg_solve(VType x_out, OP op, VType b,
                                         c1.data(), 1,
                                &(zero), p0.data(), 1);
       #else
-      Kokkos::deep_copy(yp_s, yp_s_host);
-      Kokkos::deep_copy(cp_s, cp_s_host);
-      Kokkos::deep_copy(tp_s, tp_s_host);
+      //Kokkos::deep_copy(yp_s, yp_s_host);
+      //Kokkos::deep_copy(cp_s, cp_s_host);
+      //Kokkos::deep_copy(tp_s, tp_s_host);
+      copy_to_device (yp_s, yp_s_host); // to device
+      copy_to_device (cp_s, cp_s_host); // to device
+      copy_to_device (tp_s, tp_s_host); // to device
       local_copy(y_s, yp_s); // cast
       local_copy(c_s, cp_s); // cast
       local_copy(t_s, tp_s); // cast
@@ -2227,27 +2294,32 @@ int cg_solve(VType x_out, OP op, VType b,
                                   &(one),  PRX.data(), nloc);
       #endif
       #endif
+      if (time_axpy_on) {
+        Kokkos::fence();
+        time_axpy += timer_axpy.seconds();
+        flop_axpy += 3*(4*s)*nloc;
+      }
       if (replace_residual) {
         dot(x, x, dot_result);
+        if (time_dot_on) {
+          Kokkos::fence();
+          time_dot += timer_dot.seconds();
+          flop_dot += (2*nloc-1);
+          timer_dot.reset();
+        }
         if (numRanks > 1) {
           MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                         MPI_COMM_WORLD);
         }
         Kokkos::deep_copy(dot_host, dot_result);
+        if (time_dot_on) {
+          time_dot_comm += timer_dot.seconds();
+        }
         beta0_hat = std::sqrt(*(dot_host.data()));
-        //if (verbose && myRank == 0) {
-        //  std::cout << "  (not replaced)" << std::endl;
-        //}
         d_replace += (eps / replace_tol) * (norma * (beta0_hat + scalar_type(2 + 2*maxNnzA) * beta1_hat) + scalar_type(maxNnzA) * beta2_hat);
-        //printf( " >> %e / %e * (%e*%e + %d * %e + %d * %e = %e\n",eps,replace_tol, norma,beta0_hat, 2+2*maxNnzA, beta1_hat, maxNnzA,beta2_hat,d_replace );
       }
     }
     local_mv_copy(V01, PR);
-    if (time_axpy_on) {
-      Kokkos::fence();
-      time_axpy += timer_axpy.seconds();
-      flop_axpy += 3*(4*s)*nloc;
-    }
     #if defined(KOKKOS_DEBUG_CGSOLVER)
     if (myRank == printRank) {
       Kokkos::deep_copy(CTY_host, CTY);
