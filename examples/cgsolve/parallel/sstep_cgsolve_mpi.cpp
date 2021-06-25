@@ -52,6 +52,7 @@
 #include "KokkosSparse_spmv.hpp"
 
 #include "KokkosBlas3_gemm_rr.hpp"
+#include "KokkosBlas3_gemm_rr_combined.hpp"
 
 // more detailed timer for SpMV
 //#define CGSOLVE_SPMV_TIMER
@@ -80,7 +81,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using         memory_space = typename execution_space::memory_space;
 
-//#define USE_FLOAT
+#define USE_FLOAT
 #define USE_MIXED_PRECISION
 #if defined(USE_FLOAT)
  using      scalar_type = float;
@@ -1231,7 +1232,7 @@ void axpby(ZType z1, XType x1, scalar_type beta1, YType y1,
 template <class VType, class OP>
 int cg_solve(VType x_out, OP op, VType b,
              int max_iter, scalar_type tolerance, int s, int dot_option,
-             bool replace_residual, double replace_check_tol, int replace_op, int maxNnzA, scalar_type norma,
+             bool replace_residual, double replace_check_tol, int replace_op, int maxNnzA, scalar_type norma, bool merge_rr_dots,
              bool verbose, bool time_spmv_on, bool time_dot_on, bool time_axpy_on) {
  
   using GMType = Kokkos::View<gram_scalar_type**>;
@@ -1270,6 +1271,14 @@ int cg_solve(VType x_out, OP op, VType b,
   double time_dot = 0.0;
   double time_dot_comm = 0.0;
   double flop_dot = 0.0;
+  // for rr
+  double time_dot_rr = 0.0;
+  double time_dot_rr_comm = 0.0;
+  double flop_dot_rr = 0.0;
+  // for rr
+  double time_dot_rr2 = 0.0;
+  double time_dot_rr2_comm = 0.0;
+  double flop_dot_rr2 = 0.0;
 
   Kokkos::Timer timer_axpy;
   double time_axpy = 0.0;
@@ -1299,8 +1308,11 @@ int cg_solve(VType x_out, OP op, VType b,
   scalar_type d_replace_check = 0.0;
   scalar_type d_replace_check_prev = 0.0;
   Kokkos::deep_copy(x_out, zero);
+  int num_rr = 0;
 
   int s2p1 = 2*s+1;
+  using RRType = Kokkos::View<CgsolverRR_Combined::ReduceRR::rr_sum<gram_scalar_type, scalar_type> **>;
+  RRType T_rr_device ("T_rr",   s2p1, s2p1);
   MType G_hat_device ("G_hat",  s2p1, s2p1);
   MType T_hat_device ("T_hat",  s2p1, s2p1);
   MType B_hat_device ("B_hat",  s2p1, s2p1);
@@ -1404,6 +1416,7 @@ int cg_solve(VType x_out, OP op, VType b,
   //#define KOKKOS_DEBUG_CGSOLVER
   #if 1//defined(KOKKOS_DEBUG_CGSOLVER)
   MType V_local ("V_local", nloc, s2p1);
+  auto  T_rr_host = Kokkos::create_mirror_view(T_rr_device);
   auto  V_global_host = Kokkos::create_mirror_view(V_global);
   auto  r_host   = Kokkos::create_mirror_view(r);
   auto  x_host   = Kokkos::create_mirror_view(x);
@@ -1508,8 +1521,8 @@ int cg_solve(VType x_out, OP op, VType b,
     dot(x, x, dot_result);
     if (time_dot_on) {
       Kokkos::fence();
-      time_dot += timer_dot.seconds();
-      flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+      time_dot_rr2 += timer_dot.seconds();
+      flop_dot_rr2 += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
       timer_dot.reset();
     }
     if (numRanks > 1) {
@@ -1533,6 +1546,12 @@ int cg_solve(VType x_out, OP op, VType b,
   timer_cg.reset();
   int num_iters = 0;
   int step = s;
+  // for residual-replacement
+  bool replaced = true;
+  scalar_type beta0_hat = zero;
+  scalar_type beta1_hat = zero;
+  scalar_type beta2_hat = zero;
+  scalar_type beta3_hat = zero;
   for (int k = 0; k <= max_iter && normr > tolerance; k+=step) {
 
     // ==============================================================================
@@ -1597,45 +1616,104 @@ int cg_solve(VType x_out, OP op, VType b,
     }
 
     // ==============================================================================
-    // Dot-product
-    Kokkos::fence();
-    if (time_dot_on) {
-      timer_dot.reset();
-    }
-    #if 0//defined(CGSOLVE_ENABLE_CUBLAS)
-    cublasDgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
-                2*s+1, 2*s+1, nloc, &(one),  V.data(), nloc,
-                                             V.data(), nloc,
-                                    &(zero), T_device.data(), 2*s+1);
-    #else
-    if (dot_option == 1) {
-      local_mv_copy(V2, V);
-      #if 0
-      KokkosBlas::
-      gemm("T", "N", one,  V2,
-                           V2,
-                     zero, T_device);
-      #else
-      KokkosBlas::Impl::
-      DotBasedGEMM<execution_space, GMType, GMType, GMType> gemm(one, V2, V2, zero, T_device, true);
-      gemm.run(false);
-      #endif
-    } else {
-      #if 0
-      KokkosBlas::
-      gemm("T", "N", one,  V,
-                           V,
-                     zero, T_device);
-      #else
-      // directly calling dot-based Gemm since for mixed precision, KokkosBlas::gemm ends up calling ``standard'' implementation
+    // update residual-replacement coefficient, if needed
+    // NOTE: moved/delayed here to merge with dot-product to compute G
+    if (replace_residual) {
+
+      // ==============================================================================
+      // Dot-product
+
+      // -------------------------------------------------
+      // local dot-products
+      Kokkos::fence();
+      if (time_dot_on) {
+        timer_dot.reset();
+      }
       #if defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
-       KokkosBlas::Impl::
-       DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device, true);
-       gemm.run(false);
+       if (merge_rr_dots) {
+         #if 0
+          if (!replaced) {
+            if (time_dot_on) {
+              timer_dot.reset();
+            }
+            dot(x, x, dot_result);
+            if (time_dot_on) {
+              Kokkos::fence();
+              time_dot_rr2 += timer_dot.seconds();
+              flop_dot_rr2 += (2*nloc-1);
+              timer_dot.reset();
+            }
+          }
+         #endif
+
+         // combined dot-products to compute G and G_hat, and xnorm if replaced
+         CgsolverRR_Combined::
+         DotBasedGEMM<execution_space, MType, MType, RRType, VType> gemm(one,  V, V, zero, T_rr_device, replaced, x);
+         gemm.run();
+
+         // extract T & T_hat
+         Kokkos::parallel_for(
+           "copy-DD-T", 2*s+1,
+           KOKKOS_LAMBDA(const int & i) {
+             for (int j = i; j < 2*s+1; j++) {
+               T_device(i,j) = T_rr_device(i,j).val;
+             }
+             for (int j = i; j < 2*s+1; j++) {
+               T_hat_device(i,j) = T_rr_device(i,j).val_hat;
+             }
+             if (i == 0) *(dot_result.data()) = T_rr_device(0, 0).xnorm;
+           });
+         if (time_dot_on) {
+           Kokkos::fence();
+           time_dot += timer_dot.seconds();
+           flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+           timer_dot.reset();
+         }
+       } else {
+         // dot-products to compute G
+         KokkosBlas::Impl::
+         DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device, true);
+         gemm.run(false);
+         if (time_dot_on) {
+           Kokkos::fence();
+           time_dot += timer_dot.seconds();
+           flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+           timer_dot.reset();
+         }
+
+         // another dot to compute G_hat for residual replacement
+         CgsolverRR::
+         DotBasedGEMM<execution_space, MType, MType, MType> gemm_hat(one,  V, V, zero, T_hat_device, true);
+         gemm_hat.run(false);
+         if (time_dot_on) {
+           Kokkos::fence();
+           time_dot_rr += timer_dot.seconds();
+           flop_dot_rr += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+           timer_dot.reset();
+         }
+       }
       #else
+       // dot-products to compute G
        CgsolverDD::
        DotBasedGEMM_dd<execution_space, MType, MType, DDType> gemm(one,  V, V, zero, DD_device);
        gemm.run();
+       if (time_dot_on) {
+         Kokkos::fence();
+         time_dot += timer_dot.seconds();
+         flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+         timer_dot.reset();
+       }
+
+       // another dot to compute G_hat for residual replacement
+       CgsolverRR::
+       DotBasedGEMM<execution_space, MType, MType, MType> gemm_hat(one,  V, V, zero, T_hat_device, true);
+       gemm_hat.run(false);
+       if (time_dot_on) {
+         Kokkos::fence();
+         time_dot_rr += timer_dot.seconds();
+         flop_dot_rr += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+         timer_dot.reset();
+       }
 
        // copying DD into T (aka MPI buffer)
        Kokkos::parallel_for(
@@ -1649,54 +1727,103 @@ int cg_solve(VType x_out, OP op, VType b,
            }
          });
       #endif // defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
-      #endif
-    }
-    #endif
-    if (time_dot_on) {
-      Kokkos::fence();
-      time_dot += timer_dot.seconds();
-      flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
-      timer_dot.reset();
-    }
 
-    if (numRanks > 1) {
-      Kokkos::fence();
+      // -------------------------------------------------
+      // global reduce
+      if (numRanks > 1) {
+        Kokkos::fence();
+        // global-reduce to form G
+        #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+        MPI_Allreduce(MPI_IN_PLACE, T_dd_device.data(), 2*(s2p1*s2p1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+        #else
+        MPI_Allreduce(MPI_IN_PLACE, T_device.data(), s2p1*s2p1, MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+        #endif
+
+        // global-reduce to form G_hat for residual replacement
+        MPI_Allreduce(MPI_IN_PLACE, T_hat_device.data(), s2p1*s2p1, MPI_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+
+        if (!replaced && merge_rr_dots) {
+          MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
+                        MPI_COMM_WORLD);
+          //MPI_Allreduce(MPI_IN_PLACE, &T_rr_device(0,0).xnorm, 1, MPI_SCALAR, MPI_SUM,
+          //              MPI_COMM_WORLD);
+        }
+      }
       #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-      MPI_Allreduce(MPI_IN_PLACE, T_dd_device.data(), 2*(s2p1*s2p1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+      Kokkos::deep_copy(T_dd, T_dd_device);
       #else
-      MPI_Allreduce(MPI_IN_PLACE, T_device.data(), s2p1*s2p1, MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+      Kokkos::deep_copy(T, T_device);
       #endif
-    }
-    #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
-    Kokkos::deep_copy(T_dd, T_dd_device);
-    //Kokkos::deep_copy(T, T_device);
-    //Kokkos::deep_copy(T_lo, T_lo_device);
-    #else
-    Kokkos::deep_copy(T, T_device);
-    #endif
-    if (time_dot_on) {
-      time_dot_comm += timer_dot.seconds();
-    }
+      Kokkos::deep_copy(T_hat, T_hat_device);
+      if (!replaced && merge_rr_dots) {
+        // xnorm
+        Kokkos::deep_copy(dot_host, dot_result);
+        //Kokkos::deep_copy(dot_host, T_rr_device(0,0).xnorm);
+        beta0_hat = std::sqrt(*(dot_host.data()));
+        d_replace += (eps / replace_tol) * (norma * (beta0_hat + scalar_type(2 + 2*maxNnzA) * beta1_hat) + scalar_type(maxNnzA) * beta2_hat);
+      }
+      if (time_dot_on) {
+        time_dot_rr_comm += timer_dot.seconds();
+      }
+    } else { // not residual-replacement
 
-    // another dot for residual replacement
-    if (replace_residual) {
+      // ==============================================================================
+      // Dot-product
+      Kokkos::fence();
       if (time_dot_on) {
         timer_dot.reset();
       }
-      CgsolverRR::
-      DotBasedGEMM_rr<execution_space, MType, MType, MType> gemm(one,  V, V, zero, T_hat_device, true);
-      gemm.run(false);
+      if (dot_option == 1) {
+        local_mv_copy(V2, V);
+        KokkosBlas::Impl::
+        DotBasedGEMM<execution_space, GMType, GMType, GMType> gemm(one, V2, V2, zero, T_device, true);
+        gemm.run(false);
+      } else {
+        // directly calling dot-based Gemm since for mixed precision, KokkosBlas::gemm ends up calling ``standard'' implementation
+        #if defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
+         KokkosBlas::Impl::
+         DotBasedGEMM<execution_space, MType, MType, GMType> gemm(one, V, V, zero, T_device, true);
+         gemm.run(false);
+        #else
+         CgsolverDD::
+         DotBasedGEMM_dd<execution_space, MType, MType, DDType> gemm(one,  V, V, zero, DD_device);
+         gemm.run();
+
+         // copying DD into T (aka MPI buffer)
+         Kokkos::parallel_for(
+           "copy-DD-T", 2*s+1,
+           KOKKOS_LAMBDA(const int & i) {
+             for (int j = i; j < 2*s+1; j++) {
+               T_device(i,j) = DD_device(i,j).val_hi;
+             }
+             for (int j = i; j < 2*s+1; j++) {
+               T_lo_device(i,j) = DD_device(i,j).val_lo;
+             }
+           });
+        #endif // defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
+      }
       if (time_dot_on) {
         Kokkos::fence();
         time_dot += timer_dot.seconds();
         flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
         timer_dot.reset();
       }
+
       if (numRanks > 1) {
         Kokkos::fence();
-        MPI_Allreduce(MPI_IN_PLACE, T_hat_device.data(), s2p1*s2p1, MPI_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+        #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+        MPI_Allreduce(MPI_IN_PLACE, T_dd_device.data(), 2*(s2p1*s2p1), MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+        #else
+        MPI_Allreduce(MPI_IN_PLACE, T_device.data(), s2p1*s2p1, MPI_DOT_SCALAR, MPI_SUM, MPI_COMM_WORLD);
+        #endif
       }
-      Kokkos::deep_copy(T_hat, T_hat_device);
+      #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
+      Kokkos::deep_copy(T_dd, T_dd_device);
+      //Kokkos::deep_copy(T, T_device);
+      //Kokkos::deep_copy(T_lo, T_lo_device);
+      #else
+      Kokkos::deep_copy(T, T_device);
+      #endif
       if (time_dot_on) {
         time_dot_comm += timer_dot.seconds();
       }
@@ -1828,12 +1955,8 @@ int cg_solve(VType x_out, OP op, VType b,
     gram_scalar_type alpha2 = czero;
     gram_scalar_type  beta1 = czero;
     #endif
-    scalar_type beta0_hat = zero;
-    scalar_type beta1_hat = zero;
-    scalar_type beta2_hat = zero;
-    scalar_type beta3_hat = zero;
     step = s;
-    bool replaced = false;
+    replaced = false;
     for (int i = 0; i < s; i++) {
 
       #if !defined(USE_FLOAT) & defined(USE_MIXED_PRECISION)
@@ -2040,6 +2163,7 @@ int cg_solve(VType x_out, OP op, VType b,
                       << " with d_replace = " << d_replace_prev << " -> " << d_replace
                       << " and d_replace_check = " << d_replace_check_prev << " -> " << d_replace_check;
           }
+          num_rr ++;
           // --------------------------------------
           // group update
           if (time_axpy_on) {
@@ -2105,8 +2229,8 @@ int cg_solve(VType x_out, OP op, VType b,
           dot(x_out, x_out, dot_result);
           if (time_dot_on) {
             Kokkos::fence();
-            time_dot += timer_dot.seconds();
-            flop_dot += (2*nloc-1);
+            time_dot_rr2 += timer_dot.seconds();
+            flop_dot_rr2 += (2*nloc-1);
           }
           if (numRanks > 1) {
             if (time_dot_on) {
@@ -2115,7 +2239,7 @@ int cg_solve(VType x_out, OP op, VType b,
             MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                           MPI_COMM_WORLD);
             if (time_dot_on) {
-              time_dot_comm += timer_dot.seconds();
+              time_dot_rr2_comm += timer_dot.seconds();
             }
           }
           Kokkos::deep_copy(dot_host, dot_result);
@@ -2299,12 +2423,15 @@ int cg_solve(VType x_out, OP op, VType b,
         time_axpy += timer_axpy.seconds();
         flop_axpy += 3*(4*s)*nloc;
       }
-      if (replace_residual) {
+      if (replace_residual && !merge_rr_dots) {
+        if (time_dot_on) {
+          timer_dot.reset();
+        }
         dot(x, x, dot_result);
         if (time_dot_on) {
           Kokkos::fence();
-          time_dot += timer_dot.seconds();
-          flop_dot += (2*nloc-1);
+          time_dot_rr2 += timer_dot.seconds();
+          flop_dot_rr2 += (2*nloc-1);
           timer_dot.reset();
         }
         if (numRanks > 1) {
@@ -2313,7 +2440,7 @@ int cg_solve(VType x_out, OP op, VType b,
         }
         Kokkos::deep_copy(dot_host, dot_result);
         if (time_dot_on) {
-          time_dot_comm += timer_dot.seconds();
+          time_dot_rr2_comm += timer_dot.seconds();
         }
         beta0_hat = std::sqrt(*(dot_host.data()));
         d_replace += (eps / replace_tol) * (norma * (beta0_hat + scalar_type(2 + 2*maxNnzA) * beta1_hat) + scalar_type(maxNnzA) * beta2_hat);
@@ -2460,7 +2587,15 @@ int cg_solve(VType x_out, OP op, VType b,
       //        op.getLocalDim(), op.getLocalNnz());
     }
     if (time_dot_on) {
+      flop_dot += flop_dot_rr;
+      time_dot += time_dot_rr;
+      time_dot_comm += time_dot_rr_comm;
+
+      flop_dot += flop_dot_rr2;
+      time_dot += time_dot_rr2;
+      time_dot_comm += time_dot_rr2_comm;
       flop_dot /= time_dot;
+
       double min_dot_flop = 0.0, max_dot_flop = 0.0;
       MPI_Allreduce(&flop_dot, &min_dot_flop, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
       MPI_Allreduce(&flop_dot, &max_dot_flop, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -2477,6 +2612,11 @@ int cg_solve(VType x_out, OP op, VType b,
         printf( "    + time(Dot)::comp     =  %.2e ~ %.2e seconds\n",min_dot_comp,max_dot_comp );
         printf( "    + time(Dot)::comm     =  %.2e ~ %.2e seconds\n",min_dot_comm,max_dot_comm );
         printf( "   Gflop/s(Dot)          = %.2e ~ %.2e\n", min_dot_flop/1e9,max_dot_flop/1e9);
+        if (replace_residual) {
+          printf( "    > # replacements     = %d\n", num_rr);
+          printf( "      + time(Dot)::comp     =  %.2e + %.2e seconds\n",time_dot_rr, time_dot_rr2 );
+          printf( "      + time(Dot)::comm     =  %.2e + %.2e seconds\n",time_dot_rr_comm, time_dot_rr2_comm );
+        }
       }
     }
     if (myRank == 0) {
@@ -2534,6 +2674,7 @@ int main(int argc, char *argv[]) {
     int replace_op = 1; // 0: replace at every step
     double replace_check_tol = 0.0;
     bool replace_residual = false;
+    bool merge_rr_dots = false;
 
     bool metis       = false;
     bool sort_matrix = false;
@@ -2582,6 +2723,10 @@ int main(int argc, char *argv[]) {
       }
       if((strcmp(argv[i],"-rr")==0)) {
         replace_residual = true;
+        continue;
+      }
+      if((strcmp(argv[i],"-merge-rr-dots")==0)) {
+        merge_rr_dots = true;
         continue;
       }
       if((strcmp(argv[i],"-rtol")==0)) {
@@ -2802,7 +2947,7 @@ int main(int argc, char *argv[]) {
       Kokkos::Timer timer;
       int num_iters = cg_solve<VType> (x_sub, op, b_sub,
                                        max_iter, tolerance, s, dot_option,
-                                       replace_residual, replace_check_tol, replace_op, maxNnzA, Anorm,
+                                       replace_residual, replace_check_tol, replace_op, maxNnzA, Anorm, merge_rr_dots,
                                        verbose, time_spmv, time_dot, time_axpy);
       Kokkos::fence();
       MPI_Barrier(MPI_COMM_WORLD);
