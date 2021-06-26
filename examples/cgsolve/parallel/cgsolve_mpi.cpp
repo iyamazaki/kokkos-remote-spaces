@@ -73,7 +73,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using memory_space = typename execution_space::memory_space;
 
-//#define USE_FLOAT
+#define USE_FLOAT
 #if defined(USE_FLOAT)
  using scalar_type = float;
 
@@ -989,6 +989,7 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
   VType z("z",  nloc); // store "group" update
   VType w("w",  nloc); // workspace for computing explicit residual norm (w = x + z)
   Kokkos::deep_copy(z, zero);
+  int num_rr = 0;
 
   // to compute true-residual with verbose on
   VType r_true  ("true_r",  nloc);
@@ -1244,6 +1245,7 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
         timer_dot.reset();
       }
       if (numRanks > 1) {
+        Kokkos::fence();
         MPI_Allreduce(MPI_IN_PLACE, dot_result.data(), 1, MPI_SCALAR, MPI_SUM,
                       MPI_COMM_WORLD);
       }
@@ -1316,6 +1318,7 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
         sum_x = 0.0;
         sum_r = normr;
         d_replace = (eps / replace_tol) * (maxNnzA * norma * sum_x + sum_r);
+        num_rr ++;
       } else {
         //if (verbose && myRank == 0) {
         //  std::cout << "  (not replaced)" << std::endl;
@@ -1433,6 +1436,9 @@ int cg_solve(VType x, VType b, OP1 op1, OP2 op2,
         printf( "   Gflop/s( axpy)         = %.2e (%.2e flops)\n", flop_axpy/(1e9*time_axpy), flop_axpy );
         printf( "   Gflop/s(axpby)         = %.2e (%.2e flops)\n", flop_axpby/(1e9*time_axpby), flop_axpby );
         printf( "   Gflop/s(total)         = %.2e (%.2e flops)\n", (flop_axpy+flop_axpby)/(1e9*(time_axpy+time_axpby)), flop_axpy+flop_axpby );
+      }
+      if (replace_residual) {
+        printf( "    > # replacements      = %d\n", num_rr);
       }
       printf( "\n  -------------------------------------------\n" );
     }
@@ -1689,7 +1695,8 @@ int main(int argc, char *argv[]) {
       axpby(p, one/Anorm, p, zero, p);
       for (int i = 0; i < 10; i++) {
         // r = b - A*x
-        Kokkos::deep_copy(q_sub, p);
+        //Kokkos::deep_copy(q_sub, p);
+        axpby(q_sub, one, p, zero, p);
         op.apply(p, q_global);        // p = A*p
 
         // Anorm = norm(p)
