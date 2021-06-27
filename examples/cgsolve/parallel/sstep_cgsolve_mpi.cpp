@@ -81,7 +81,7 @@ using      execution_space = typename Kokkos::DefaultExecutionSpace;
 
 using         memory_space = typename execution_space::memory_space;
 
-#define USE_FLOAT
+//#define USE_FLOAT
 #define USE_MIXED_PRECISION
 #if defined(USE_FLOAT)
  using      scalar_type = float;
@@ -142,6 +142,7 @@ using         memory_space = typename execution_space::memory_space;
  #define cblas_rdot          cblas_ddot
  #if defined(USE_MIXED_PRECISION)
  #include "KokkosBlas3_gemm_dd.hpp"
+ #include "KokkosBlas3_gemm_dd_rr.hpp"
  #include "qd/dd_real.h"
  #include "mblas_dd.h"
  #endif
@@ -1311,7 +1312,11 @@ int cg_solve(VType x_out, OP op, VType b,
   int num_rr = 0;
 
   int s2p1 = 2*s+1;
+  #if defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
   using RRType = Kokkos::View<CgsolverRR_Combined::ReduceRR::rr_sum<gram_scalar_type, scalar_type> **>;
+  #else
+  using RRType = Kokkos::View<CgsolverDD_RR::ReduceDD::dd_sum **>;
+  #endif
   RRType T_rr_device ("T_rr",   s2p1, s2p1);
   MType G_hat_device ("G_hat",  s2p1, s2p1);
   MType T_hat_device ("T_hat",  s2p1, s2p1);
@@ -1634,21 +1639,6 @@ int cg_solve(VType x_out, OP op, VType b,
       }
       #if defined(USE_FLOAT) | !defined(USE_MIXED_PRECISION)
        if (merge_rr_dots) {
-         #if 0
-          if (!replaced) {
-            if (time_dot_on) {
-              timer_dot.reset();
-            }
-            dot(x, x, dot_result);
-            if (time_dot_on) {
-              Kokkos::fence();
-              time_dot_rr2 += timer_dot.seconds();
-              flop_dot_rr2 += (2*nloc-1);
-              timer_dot.reset();
-            }
-          }
-         #endif
-
          // combined dot-products to compute G and G_hat, and xnorm if replaced
          CgsolverRR_Combined::
          DotBasedGEMM<execution_space, MType, MType, RRType, VType> gemm(one,  V, V, zero, T_rr_device, replaced, x);
@@ -1696,26 +1686,53 @@ int cg_solve(VType x_out, OP op, VType b,
          }
        }
       #else
-       // dot-products to compute G
-       CgsolverDD::
-       DotBasedGEMM_dd<execution_space, MType, MType, DDType> gemm(one,  V, V, zero, DD_device);
-       gemm.run();
-       if (time_dot_on) {
-         Kokkos::fence();
-         time_dot += timer_dot.seconds();
-         flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
-         timer_dot.reset();
-       }
+       if (merge_rr_dots) {
+         // combined dot-products to compute G and G_hat, and xnorm if replaced
+         CgsolverDD_RR::
+         DotBasedGEMM<execution_space, MType, MType, RRType, VType> gemm(one,  V, V, zero, T_rr_device, replaced, x);
+         gemm.run();
 
-       // another dot to compute G_hat for residual replacement
-       CgsolverRR::
-       DotBasedGEMM<execution_space, MType, MType, MType> gemm_hat(one,  V, V, zero, T_hat_device, true);
-       gemm_hat.run(false);
-       if (time_dot_on) {
-         Kokkos::fence();
-         time_dot_rr += timer_dot.seconds();
-         flop_dot_rr += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
-         timer_dot.reset();
+         // extract T & T_hat
+         Kokkos::parallel_for(
+           "copy-DD-T", 2*s+1,
+           KOKKOS_LAMBDA(const int & i) {
+             for (int j = i; j < 2*s+1; j++) {
+               DD_device(i,j).val_hi = T_rr_device(i,j).val_hi;
+               DD_device(i,j).val_lo = T_rr_device(i,j).val_lo;
+             }
+             for (int j = i; j < 2*s+1; j++) {
+               T_hat_device(i,j) = T_rr_device(i,j).val_hat;
+             }
+             if (i == 0) *(dot_result.data()) = T_rr_device(0, 0).xnorm;
+           });
+         if (time_dot_on) {
+           Kokkos::fence();
+           time_dot += timer_dot.seconds();
+           flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+           timer_dot.reset();
+         }
+       } else {
+         // dot-products to compute G
+         CgsolverDD::
+         DotBasedGEMM_dd<execution_space, MType, MType, DDType> gemm(one,  V, V, zero, DD_device);
+         gemm.run();
+         if (time_dot_on) {
+           Kokkos::fence();
+           time_dot += timer_dot.seconds();
+           flop_dot += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+           timer_dot.reset();
+         }
+
+         // another dot to compute G_hat for residual replacement
+         CgsolverRR::
+         DotBasedGEMM<execution_space, MType, MType, MType> gemm_hat(one,  V, V, zero, T_hat_device, true);
+         gemm_hat.run(false);
+         if (time_dot_on) {
+           Kokkos::fence();
+           time_dot_rr += timer_dot.seconds();
+           flop_dot_rr += ((s2p1*s2p1+s2p1)/2)*(2*nloc-1);
+           timer_dot.reset();
+         }
        }
 
        // copying DD into T (aka MPI buffer)
